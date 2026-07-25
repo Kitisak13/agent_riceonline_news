@@ -47,6 +47,7 @@ from config import (
     REQUIRED_ENV_KEYS,
     SELENIUM_SESSION_MAX_URLS,
     SELENIUM_WAIT_TIMEOUT,
+    OUTPUT_SOURCE_FILE,
 )
 from utils import (
     DomainFailureCache,

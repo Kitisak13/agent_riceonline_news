@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from config import (
     RICEONLINE_URL,
     USER_AGENT,
+    DATA_DIR,
 )
 from utils import (
     logger,
@@ -21,7 +22,7 @@ from utils import (
 )
 
 load_dotenv()
-OUTPUT_FILE = 'raw_headline.json'
+OUTPUT_FILE = os.path.join(DATA_DIR, 'raw_headline.json')
 
 
 def scrape_headlines():

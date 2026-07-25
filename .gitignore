@@ -15,13 +15,16 @@ logs/
 *.log
 scratch/
 
-# Generated output files & caches
-*.docx
+# Generated data & caches
+data/*.json
 processed_history.json
 failed_domains_cache.json
 raw_headline.json
 source.json
 edit.json
+
+# Generated documents
+*.docx
 
 # IDE / OS settings
 .vscode/

@@ -1,9 +1,17 @@
 # config.py - Shared Configuration for Rice News Aggregator (Free AI V1)
 # =====================================================================
 
+import os
+
+# --- PATHS & DIRECTORIES ---
+DATA_DIR = "data"
+LOG_DIR = "logs"
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
+
 # --- API & SCRAPING CONFIG ---
 RICEONLINE_URL = "https://riceonline.com/"
-OUTPUT_SOURCE_FILE = "source.json"
+OUTPUT_SOURCE_FILE = os.path.join(DATA_DIR, "source.json")
 
 # --- SELENIUM CONFIG ---
 HEADLESS_BROWSER = True  # Run in headless mode (no UI)
@@ -81,5 +89,5 @@ SELENIUM_REQUIRED_DOMAINS = [
 ]
 
 # --- DOMAINS TO AUTO-LEARN ---
-FAILED_DOMAINS_CACHE_FILE = "failed_domains_cache.json"
+FAILED_DOMAINS_CACHE_FILE = os.path.join(DATA_DIR, "failed_domains_cache.json")
 FAILED_DOMAINS_THRESHOLD = 2

@@ -21,6 +21,7 @@ from config import (
     GOOGLE_API_RESULTS,
     GEMINI_PRIMARY_MODEL,
     USER_AGENT,
+    DATA_DIR,
 )
 from utils import (
     logger,
@@ -63,7 +64,7 @@ GOOGLE_API_DAILY_LIMIT = 100
 API_CALL_COUNT = 0
 
 # --- DUPLICATE DETECTION ---
-HISTORY_FILE = 'processed_history.json'
+HISTORY_FILE = os.path.join(DATA_DIR, 'processed_history.json')
 
 
 def _load_history() -> Dict[str, List[str]]:
