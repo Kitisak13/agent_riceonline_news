@@ -1,15 +1,19 @@
 # source.py - News Discovery Module (News Scout) - Free AI V1
 # ==========================================================
 
+import difflib
 import json
 import os
 import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
+
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from google import genai
+from google.genai import types
 
 from config import (
     RICEONLINE_URL,
@@ -20,6 +24,7 @@ from config import (
     GOOGLE_API_DELAY,
     GOOGLE_API_RESULTS,
     GEMINI_PRIMARY_MODEL,
+    GEMINI_FALLBACK_MODEL,
     USER_AGENT,
     DATA_DIR,
 )
@@ -34,6 +39,7 @@ from utils import (
     resolve_google_redirect,
     save_json_atomic,
     clean_json_response,
+    extract_domain,
 )
 
 # Load environment variables
@@ -63,8 +69,99 @@ CURRENT_YEAR = datetime.now().year
 GOOGLE_API_DAILY_LIMIT = 100
 API_CALL_COUNT = 0
 
-# --- DUPLICATE DETECTION ---
+# --- DATA FILES ---
 HISTORY_FILE = os.path.join(DATA_DIR, 'processed_history.json')
+LEARNED_DOMAINS_FILE = os.path.join(DATA_DIR, 'learned_source_domains.json')
+
+
+# ==============================================================================
+# AUTO-LEARNING SOURCE DOMAIN MANAGER
+# ==============================================================================
+class SourceDomainManager:
+    """
+    Manages mapping of News Source names to official web domains.
+    Includes built-in mappings and auto-learns new domains dynamically.
+    """
+    _instance = None
+
+    BUILTIN_DOMAINS = {
+        "reuters": "reuters.com",
+        "bloomberg": "bloomberg.com",
+        "wsj": "wsj.com",
+        "wall street journal": "wsj.com",
+        "nikkei": "asia.nikkei.com",
+        "financial times": "ft.com",
+        "the hindu": "thehindu.com",
+        "times of india": "timesofindia.indiatimes.com",
+        "business standard": "business-standard.com",
+        "bangkok post": "bangkokpost.com",
+        "the nation": "nationthailand.com",
+        "vietnam plus": "en.vietnamplus.vn",
+        "vna": "en.vietnamplus.vn",
+        "agweb": "agweb.com",
+        "agriculture": "agriculture.com",
+        "farm progress": "farmprogress.com",
+        "usda": "fas.usda.gov",
+        "oryza": "oryza.com",
+        "livemint": "livemint.com",
+        "cnbc": "cnbc.com",
+        "bbc": "bbc.com",
+    }
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._learned = cls._instance._load_learned()
+        return cls._instance
+
+    def _load_learned(self) -> Dict[str, str]:
+        if os.path.exists(LEARNED_DOMAINS_FILE):
+            try:
+                with open(LEARNED_DOMAINS_FILE, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError):
+                pass
+        return {}
+
+    def get_domain(self, source_name: str) -> Optional[str]:
+        if not source_name:
+            return None
+        src_key = source_name.strip().lower()
+
+        # 1. Check auto-learned cache first
+        if src_key in self._learned:
+            return self._learned[src_key]
+
+        # 2. Check built-in mappings
+        for key, domain in self.BUILTIN_DOMAINS.items():
+            if key in src_key or src_key in key:
+                return domain
+
+        return None
+
+    def learn_domain(self, source_name: str, url: str) -> None:
+        if not source_name or not url:
+            return
+        domain = extract_domain(url)
+        if not domain or is_blocked_domain(url):
+            return
+
+        src_key = source_name.strip().lower()
+        if self._learned.get(src_key) != domain:
+            self._learned[src_key] = domain
+            save_json_atomic(LEARNED_DOMAINS_FILE, self._learned)
+            logger.info(f"🧠 Auto-learned Source Domain: '{source_name}' ➔ '{domain}'")
+
+
+def calculate_title_similarity(target_headline: str, candidate_title: str) -> float:
+    """
+    Calculate text similarity ratio between target headline and candidate title.
+    """
+    if not target_headline or not candidate_title:
+        return 0.0
+    t1 = target_headline.lower().strip()
+    t2 = candidate_title.lower().strip()
+    return difflib.SequenceMatcher(None, t1, t2).ratio()
 
 
 def _load_history() -> Dict[str, List[str]]:
@@ -125,7 +222,6 @@ def _call_google_api_with_retry(params: Dict[str, Any], max_retries: int = 3) ->
 def smart_select_url(headline: str, source: str, search_items: List[Dict[str, Any]]) -> Optional[str]:
     """
     Use Gemini to select the best URL from search candidates.
-    Prioritizes the correct source name.
     """
     if not gemini_client:
         logger.warning("   ⚠️ Gemini client not configured, falling back to first match")
@@ -185,73 +281,154 @@ def smart_select_url(headline: str, source: str, search_items: List[Dict[str, An
         return None
 
 
+def gemini_direct_grounding_search(headline: str, source: str) -> Optional[str]:
+    """
+    Tier 4 Fallback: Use Gemini 2.5 Flash Search Grounding to find original news article URL.
+    """
+    if not gemini_client:
+        return None
+
+    logger.info(f"   🧠 [Tier 4 Gemini Search Grounding] Searching for: {headline[:50]}...")
+    prompt = f"""
+    Find the direct original news article URL for this headline and source.
+    
+    Headline: "{headline}"
+    Source: "{source}"
+    
+    Respond with ONLY the exact direct article URL. Do not summarize or add markdown. If not found, respond "None".
+    """
+
+    try:
+        gemini_limiter.wait()
+        config = types.GenerateContentConfig(
+            tools=[types.Tool(google_search=types.GoogleSearch())]
+        )
+        response = gemini_client.models.generate_content(
+            model=GEMINI_FALLBACK_MODEL,
+            contents=prompt,
+            config=config
+        )
+        url = response.text.strip().replace("```", "").strip()
+        if url.startswith("http") and "None" not in url and is_valid_url(url):
+            resolved = resolve_google_redirect(url)
+            if is_valid_url(resolved):
+                logger.info(f"   ✅ [Tier 4 Hit!] {resolved[:60]}...")
+                return resolved
+    except Exception as e:
+        logger.warning(f"   ⚠️ Tier 4 Gemini Search Grounding failed: {e}")
+
+    return None
+
+
 def find_real_url(headline: str, source: str) -> Optional[str]:
     """
-    Search Google Custom Search using an optimized query (clean headline only),
-    and ask Gemini to choose the best URL.
+    4-Tier Search Strategy with Auto-Learning Domain Resolution:
+    - Tier 1: Target Domain Search (site:domain.com) if domain known
+    - Tier 2: Source Name + Headline Phrase Search
+    - Tier 3: Exact Headline Search + Fuzzy Title Match Verification
+    - Tier 4: Gemini 2.5 Flash Direct Search Grounding Fallback
     """
-    if API_CALL_COUNT >= GOOGLE_API_DAILY_LIMIT:
-        return None
-
-    if not API_KEY or not SEARCH_ENGINE_ID:
-        logger.error("Missing GOOGLE_SEARCH_API_KEY or GOOGLE_SEARCH_CX")
-        return None
+    domain_manager = SourceDomainManager()
+    known_domain = domain_manager.get_domain(source)
 
     clean_headline = headline.replace('"', '').replace("'", "").strip()
-    if len(clean_headline) > 100:
-        clean_headline = clean_headline[:100]
+    clean_headline_short = clean_headline[:80]
 
-    query = clean_headline
+    # --- TIER 1: Target Domain Search (site:domain.com) ---
+    if known_domain and API_KEY and SEARCH_ENGINE_ID and API_CALL_COUNT < GOOGLE_API_DAILY_LIMIT:
+        query_t1 = f"site:{known_domain} {clean_headline_short}"
+        logger.info(f"   🎯 [Tier 1 Domain Match: {known_domain}] {query_t1[:55]}...")
+        params_t1 = {
+            'key': API_KEY,
+            'cx': SEARCH_ENGINE_ID,
+            'q': query_t1,
+            'num': 5,
+            'gl': 'us',
+            'lr': 'lang_en',
+            'dateRestrict': f'd{DATE_RESTRICT_DAYS}',
+        }
+        data_t1 = _call_google_api_with_retry(params_t1)
+        if data_t1 and data_t1.get('items'):
+            for item in data_t1['items']:
+                link = item.get('link', '')
+                title = item.get('title', '')
+                if known_domain in link.lower() and is_valid_url(link):
+                    sim = calculate_title_similarity(headline, title)
+                    if sim >= 0.25:
+                        resolved = resolve_google_redirect(link)
+                        if is_valid_url(resolved):
+                            logger.info(f"   ✅ [Tier 1 Hit!] (sim={sim:.2f}) {resolved[:60]}...")
+                            return resolved
 
-    params = {
-        'key': API_KEY,
-        'cx': SEARCH_ENGINE_ID,
-        'q': query,
-        'num': GOOGLE_API_RESULTS,
-        'gl': 'us',
-        'lr': 'lang_en',
-    }
+    # --- TIER 2: Source Name + Headline Search ---
+    if API_KEY and SEARCH_ENGINE_ID and API_CALL_COUNT < GOOGLE_API_DAILY_LIMIT:
+        query_t2 = f'"{source}" "{clean_headline_short}"'
+        logger.info(f"   🔎 [Tier 2 Source+Phrase Search] {query_t2[:55]}...")
+        params_t2 = {
+            'key': API_KEY,
+            'cx': SEARCH_ENGINE_ID,
+            'q': query_t2,
+            'num': 5,
+            'gl': 'us',
+            'lr': 'lang_en',
+        }
+        data_t2 = _call_google_api_with_retry(params_t2)
+        if data_t2 and data_t2.get('items'):
+            for item in data_t2['items']:
+                link = item.get('link', '')
+                title = item.get('title', '')
+                if is_valid_url(link):
+                    sim = calculate_title_similarity(headline, title)
+                    if sim >= 0.30:
+                        resolved = resolve_google_redirect(link)
+                        if is_valid_url(resolved):
+                            logger.info(f"   ✅ [Tier 2 Hit!] (sim={sim:.2f}) {resolved[:60]}...")
+                            domain_manager.learn_domain(source, resolved)
+                            return resolved
 
-    # First attempt: Try restricting to date
-    params['dateRestrict'] = f'd{DATE_RESTRICT_DAYS}'
-    params['sort'] = 'date'
-    
-    logger.info(f"   🔎 [date-restricted search] {query[:55]}...")
-    data = _call_google_api_with_retry(params)
-    
-    # If no results, try relaxed search without date restrict
-    if not data or not data.get('items'):
-        if API_CALL_COUNT < GOOGLE_API_DAILY_LIMIT:
-            logger.info("   ⚠️ No recent results, trying relaxed search...")
-            if 'dateRestrict' in params: del params['dateRestrict']
-            if 'sort' in params: del params['sort']
-            data = _call_google_api_with_retry(params)
+    # --- TIER 3: Exact Headline Search + AI / Fuzzy Select ---
+    if API_KEY and SEARCH_ENGINE_ID and API_CALL_COUNT < GOOGLE_API_DAILY_LIMIT:
+        query_t3 = f'"{clean_headline_short}"'
+        logger.info(f"   🔎 [Tier 3 Headline Search] {query_t3[:55]}...")
+        params_t3 = {
+            'key': API_KEY,
+            'cx': SEARCH_ENGINE_ID,
+            'q': query_t3,
+            'num': GOOGLE_API_RESULTS,
+            'gl': 'us',
+            'lr': 'lang_en',
+        }
+        data_t3 = _call_google_api_with_retry(params_t3)
+        if data_t3 and data_t3.get('items'):
+            items = data_t3['items']
+            selected_url = smart_select_url(headline, source, items)
+            if selected_url:
+                resolved = resolve_google_redirect(selected_url)
+                if is_valid_url(resolved):
+                    logger.info(f"   ✅ [Tier 3 Hit! AI Selected] {resolved[:60]}...")
+                    domain_manager.learn_domain(source, resolved)
+                    return resolved
 
-    if not data or not data.get('items'):
-        logger.warning("   ❌ No search results returned from Google")
-        return None
+            # Fallback scan for Tier 3
+            for item in items:
+                link = item.get('link', '')
+                title = item.get('title', '')
+                if is_valid_url(link):
+                    sim = calculate_title_similarity(headline, title)
+                    if sim >= 0.35:
+                        resolved = resolve_google_redirect(link)
+                        if is_valid_url(resolved):
+                            logger.info(f"   ✅ [Tier 3 Fallback Hit!] (sim={sim:.2f}) {resolved[:60]}...")
+                            domain_manager.learn_domain(source, resolved)
+                            return resolved
 
-    items = data.get('items', [])
-    
-    # Let Gemini select the best URL
-    selected_url = smart_select_url(headline, source, items)
-    
-    if selected_url:
-        resolved_url = resolve_google_redirect(selected_url)
-        if is_valid_url(resolved_url):
-            return resolved_url
-            
-    # Fallback: scan candidate list linearly if Gemini failed or made an invalid choice
-    logger.info("   ⚠️ Falling back to linear scan of search results...")
-    for item in items:
-        url = item.get('link')
-        if not url: continue
-        resolved_url = resolve_google_redirect(url)
-        if is_valid_url(resolved_url):
-            logger.info(f"   ✅ Found (Fallback): {resolved_url[:60]}...")
-            return resolved_url
+    # --- TIER 4: Gemini Direct Search Grounding Fallback ---
+    tier4_url = gemini_direct_grounding_search(headline, source)
+    if tier4_url:
+        domain_manager.learn_domain(source, tier4_url)
+        return tier4_url
 
-    logger.warning("   ❌ No suitable URL found")
+    logger.warning("   ❌ All 4 Search Tiers failed to find suitable URL")
     return None
 
 
@@ -260,7 +437,7 @@ def scrape_riceonline() -> List[Dict[str, str]]:
     start_time = time.time()
     
     logger.info("=" * 60)
-    logger.info("🌾 RICE NEWS SCOUT V1 - Starting")
+    logger.info("🌾 RICE NEWS SCOUT V1 - Starting (4-Tier Auto-Learning Search)")
     logger.info("=" * 60)
     
     lookback_days, lookback_msg = calculate_lookback_days()
@@ -324,10 +501,6 @@ def scrape_riceonline() -> List[Dict[str, str]]:
     logger.info(f"📚 Duplicate DB: {len(known_headlines)} headlines tracked")
     
     for i, link in enumerate(candidate_links, 1):
-        if API_CALL_COUNT >= GOOGLE_API_DAILY_LIMIT:
-            logger.warning("🛑 Google Search API daily limit reached! Stopping further searches.")
-            break
-
         raw_text = link.get_text(" ", strip=True)
         
         if '"' not in raw_text:
@@ -346,7 +519,7 @@ def scrape_riceonline() -> List[Dict[str, str]]:
             logger.info(f"   🔁 Duplicate skipped: {headline[:45]}...")
             continue
         
-        logger.info(f"\n[{i}/{len(candidate_links)}] {headline[:45]}...")
+        logger.info(f"\n[{i}/{len(candidate_links)}] Source: '{source}' | {headline[:45]}...")
         
         real_url = find_real_url(headline, source)
         
@@ -369,7 +542,7 @@ def scrape_riceonline() -> List[Dict[str, str]]:
             history["processed_urls"].append(real_url)
         else:
             skipped_count += 1
-            logger.info(f"   ⏭️ Skipped (no recent URL found)")
+            logger.info("   ⏭️ Skipped (no recent URL found)")
         
         time.sleep(GOOGLE_API_DELAY)
 
