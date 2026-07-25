@@ -1,0 +1,27 @@
+# Rice News Aggregator - Python Dependencies (Free AI V1)
+# ===========================================
+
+# HTTP & Scraping
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+trafilatura>=1.6.0
+curl_cffi>=0.7.0  # For Cloudflare bypass
+
+# Browser Automation
+selenium>=4.15.0
+webdriver-manager>=4.0.0
+
+# AI & LLM
+google-genai>=1.0.0  # New Gemini SDK
+
+# Document Generation
+python-docx>=1.1.0
+
+# Google APIs
+google-api-python-client>=2.100.0
+google-auth-httplib2>=0.2.0
+google-auth-oauthlib>=1.2.0
+
+# Environment & Config
+python-dotenv>=1.0.0

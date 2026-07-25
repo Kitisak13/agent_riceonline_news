@@ -1,0 +1,30 @@
+# Environment variables
+.env
+*.env
+
+# Python cache & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+
+# Logs & temp files
+logs/
+*.log
+scratch/
+
+# Generated output files & caches
+*.docx
+processed_history.json
+failed_domains_cache.json
+raw_headline.json
+source.json
+edit.json
+
+# IDE / OS settings
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
