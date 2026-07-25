@@ -1,31 +1,26 @@
 # main.py - Report Generation Module (Editor & Production) - Free AI V1
 # ======================================================================
 
+import atexit
 import json
 import os
 import random
-import smtplib
+import threading
 import time
-import atexit
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from email import encoders
-from email.mime.base import MIMEBase
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
+from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
 import requests
 import trafilatura
-from docx import Document
-from docx.oxml import OxmlElement
-from docx.oxml.ns import qn
-from docx.shared import Pt
 from dotenv import load_dotenv
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
 from google import genai
 from google.genai import types
+
+# Module imports
+from docx_generator import create_document
+from notifier import send_email, upload_to_drive
 
 # Try importing curl_cffi for Cloudflare bypass, fallback to None
 try:
@@ -52,19 +47,17 @@ from config import (
     REQUIRED_ENV_KEYS,
     SELENIUM_SESSION_MAX_URLS,
     SELENIUM_WAIT_TIMEOUT,
-    USER_AGENT,
 )
 from utils import (
     DomainFailureCache,
+    clean_json_response,
     format_duration,
+    gemini_limiter,
     is_old_news,
     is_valid_url,
     logger,
     mask_sensitive_value,
-    parse_date_flexible,
     requires_selenium,
-    resolve_google_redirect,
-    gemini_limiter,
 )
 
 # Load environment variables
@@ -74,6 +67,7 @@ if not os.getenv("GEMINI_API_KEY"):
 
 INPUT_FILE = 'source.json'
 TEST_MODE = False
+CONCURRENT_WORKERS = 4  # Concurrent workers for HTTP scraping
 
 # User agent rotation
 USER_AGENTS = [
@@ -83,11 +77,14 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:134.0) Gecko/20100101 Firefox/134.0",
 ]
 
-def get_random_user_agent():
+
+def get_random_user_agent() -> str:
     return random.choice(USER_AGENTS)
 
-def get_google_cache_url(url):
+
+def get_google_cache_url(url: str) -> str:
     return f"https://webcache.googleusercontent.com/search?q=cache:{quote(url)}"
+
 
 # Configure Gemini Client
 gemini_client = None
@@ -95,23 +92,26 @@ if os.getenv("GEMINI_API_KEY"):
     try:
         clean_key = os.getenv("GEMINI_API_KEY").strip().strip('"').strip("'")
         gemini_client = genai.Client(api_key=clean_key)
-        logger.info(f"✨ Gemini Client configured for editing and fallbacks.")
+        logger.info("✨ Gemini Client configured for editing and fallbacks.")
     except Exception as e:
         logger.error(f"Failed to configure Gemini: {e}")
 
 
 # ==============================================================================
-# SELENIUM SESSION MANAGER
+# THREAD-SAFE SELENIUM SESSION MANAGER
 # ==============================================================================
 class SeleniumSessionManager:
     _instance = None
+    _lock = threading.Lock()
     
     def __new__(cls):
         if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._driver = None
-            cls._instance._url_count = 0
-            cls._instance._max_urls = SELENIUM_SESSION_MAX_URLS
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._driver = None
+                    cls._instance._url_count = 0
+                    cls._instance._max_urls = SELENIUM_SESSION_MAX_URLS
         return cls._instance
     
     def _create_driver(self):
@@ -153,7 +153,6 @@ class SeleniumSessionManager:
             if os.path.exists(local_driver_path):
                 service = Service(executable_path=local_driver_path)
             else:
-                # Search parent directory as well
                 parent_driver = os.path.join(os.getcwd(), "..", "chromedriver.exe")
                 if os.path.exists(parent_driver):
                     service = Service(executable_path=parent_driver)
@@ -235,58 +234,58 @@ class SeleniumSessionManager:
         except Exception:
             pass
 
-    def scrape_url(self, url, use_cache_fallback=True):
-        try:
-            driver = self._get_driver()
-            logger.info(f"   🌐 Selenium [{self._url_count + 1}/{self._max_urls}]: {url[:50]}...")
-            time.sleep(random.uniform(0.5, 1.5))
-            
-            driver.get(url)
-            self._url_count += 1
-            
-            content_loaded = self._wait_for_content(driver)
-            
-            if self._is_cloudflare_blocked(driver):
-                logger.warning("   🛡️ Cloudflare detected in Selenium!")
-                if use_cache_fallback:
-                    logger.info("   📦 Trying Google Cache fallback...")
-                    cache_url = get_google_cache_url(url)
-                    time.sleep(random.uniform(1, 2))
-                    driver.get(cache_url)
-                    self._url_count += 1
-                    if not self._wait_for_content(driver):
-                        logger.error("   ❌ Cache fallback failed")
+    def scrape_url(self, url: str, use_cache_fallback: bool = True) -> Optional[str]:
+        with self._lock:
+            try:
+                driver = self._get_driver()
+                logger.info(f"   🌐 Selenium [{self._url_count + 1}/{self._max_urls}]: {url[:50]}...")
+                time.sleep(random.uniform(0.5, 1.5))
+                
+                driver.get(url)
+                self._url_count += 1
+                
+                content_loaded = self._wait_for_content(driver)
+                
+                if self._is_cloudflare_blocked(driver):
+                    logger.warning("   🛡️ Cloudflare detected in Selenium!")
+                    if use_cache_fallback:
+                        logger.info("   📦 Trying Google Cache fallback...")
+                        cache_url = get_google_cache_url(url)
+                        time.sleep(random.uniform(1, 2))
+                        driver.get(cache_url)
+                        self._url_count += 1
+                        if not self._wait_for_content(driver):
+                            logger.error("   ❌ Cache fallback failed")
+                            return None
+                    else:
                         return None
+                
+                self._expand_hidden_content(driver)
+                html = driver.page_source
+                
+                extract_params = {'include_comments': False, 'include_tables': True, 'output_format': 'json', 'with_metadata': True}
+                extract_str = trafilatura.extract(html, **extract_params)
+                if extract_str:
+                    return json.loads(extract_str).get('text', '')
+                
+                body = driver.find_element(By.TAG_NAME, "body")
+                text = body.text.strip()
+                return text if len(text) > 200 else None
+                
+            except Exception as e:
+                error_msg = str(e).lower()
+                if any(term in error_msg for term in ["timeout", "max retries", "connectionpool", "not reachable"]):
+                    logger.error(f"   ❌ Critical Driver Error: {str(e)[:100]}")
+                    self._close_driver()
                 else:
-                    return None
-            
-            self._expand_hidden_content(driver)
-            html = driver.page_source
-            
-            # Try Trafilatura on HTML
-            extract_params = {'include_comments': False, 'include_tables': True, 'output_format': 'json', 'with_metadata': True}
-            extract_str = trafilatura.extract(html, **extract_params)
-            if extract_str:
-                return json.loads(extract_str).get('text', '')
-            
-            # Fallback to body.text
-            body = driver.find_element(By.TAG_NAME, "body")
-            text = body.text.strip()
-            return text if len(text) > 200 else None
-            
-        except Exception as e:
-            error_msg = str(e).lower()
-            if any(term in error_msg for term in ["timeout", "max retries", "connectionpool", "not reachable"]):
-                logger.error(f"   ❌ Critical Driver Error: {str(e)[:100]}")
-                self._close_driver()
-            else:
-                logger.error(f"   ❌ Selenium Error: {e}")
-                self._close_driver()
-            return None
+                    logger.error(f"   ❌ Selenium Error: {e}")
+                    self._close_driver()
+                return None
     
     def close(self):
-        self._close_driver()
-        logger.info("   🔒 Browser session closed")
+        with self._lock:
+            self._close_driver()
+            logger.info("   🔒 Browser session closed")
 
 
 _selenium_manager = None
@@ -309,7 +308,7 @@ atexit.register(cleanup_selenium)
 # PIPELINE STAGES
 # ==============================================================================
 
-def check_system_health():
+def check_system_health() -> bool:
     logger.info("=" * 60)
     logger.info("🕵️ SYSTEM DIAGNOSTIC (Free AI V1)")
     logger.info(f"   Working Directory: {os.getcwd()}")
@@ -330,10 +329,9 @@ def check_system_health():
     return len(missing_keys) == 0
 
 
-def gemini_grounding_fallback_scrape(url):
+def gemini_grounding_fallback_scrape(url: str) -> Optional[Dict[str, str]]:
     """
-    Fallback Layer 5: If all HTTP & Selenium scrapers fail (due to Cloudflare, bot protections, etc.),
-    use Gemini 2.5 Flash Search Grounding (20 RPD) to search Google for the exact URL and extract text.
+    Fallback Layer 5: Search Grounding via gemini-2.5-flash
     """
     if not gemini_client:
         return None
@@ -353,14 +351,12 @@ def gemini_grounding_fallback_scrape(url):
     """
     
     try:
-        # Respect rate limits
         gemini_limiter.wait()
         
         config = types.GenerateContentConfig(
             tools=[types.Tool(google_search=types.GoogleSearch())]
         )
         
-        # We must use gemini-2.5-flash since 3.1-flash-lite doesn't have Search Grounding quota (0 RPD)
         response = gemini_client.models.generate_content(
             model=GEMINI_FALLBACK_MODEL,
             contents=prompt,
@@ -384,15 +380,14 @@ def gemini_grounding_fallback_scrape(url):
         return None
 
 
-def scrape_content(url):
+def scrape_content(url: str) -> Optional[Any]:
     """
     Multi-layer Scraping Pipeline.
     """
     domain_cache = DomainFailureCache()
     
-    # Layer 0: Check fast-track list
     if requires_selenium(url):
-        logger.info(f"   ⚡ Fast-track to Selenium (known domain)")
+        logger.info("   ⚡ Fast-track to Selenium (known domain)")
         manager = get_selenium_manager()
         text = manager.scrape_url(url, use_cache_fallback=True)
         if text:
@@ -401,10 +396,10 @@ def scrape_content(url):
         
     extract_params = {'include_comments': False, 'include_tables': True, 'output_format': 'json', 'with_metadata': True}
     
-    # Layer 1: Try curl_cffi (if available) -> bypasses Cloudflare extremely well
+    # Layer 1: Try curl_cffi
     if curl_requests:
         try:
-            logger.debug(f"   尝试 curl_cffi: {url[:50]}...")
+            logger.debug(f"   curl_cffi attempt: {url[:50]}...")
             headers = {
                 'User-Agent': get_random_user_agent(),
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -478,9 +473,9 @@ def scrape_content(url):
     return None
 
 
-def process_with_ai(headline, content, metadata_date=None):
+def process_with_ai(headline: str, content: str, metadata_date: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """
-    Clean and format content using gemini-3.1-flash-lite (completely free, 500 RPD).
+    Clean and format content using gemini-3.1-flash-lite with clean JSON parsing.
     """
     if not gemini_client:
         return None
@@ -497,7 +492,7 @@ def process_with_ai(headline, content, metadata_date=None):
     3. REMOVE ONLY: Ads, social media widgets, navigation/headers/footers, and links to unrelated stories.
     4. FORMAT: Use double newlines (\\n\\n) between paragraphs.
     5. If the raw content does not contain the actual news article corresponding to the headline (e.g. it is just page navigation, a list of other news, a cookie consent warning, or a video player with no text transcript), set "full_content" to "(Can not find the content)".
-    6. Output must be valid JSON matching the format below. Do not add markdown backticks wrapper around the JSON.
+    6. Output must be valid JSON matching the format below.
     
     Headline: {headline}
     {date_context}
@@ -515,8 +510,6 @@ def process_with_ai(headline, content, metadata_date=None):
     for attempt in range(MAX_RETRIES):
         try:
             logger.debug(f"   🤖 AI Call (attempt {attempt+1}/3)...")
-            
-            # Rate limiting
             gemini_limiter.wait()
             
             response = gemini_client.models.generate_content(
@@ -531,14 +524,12 @@ def process_with_ai(headline, content, metadata_date=None):
             raw_response = response.text
             if not raw_response:
                 raise ValueError("Response text is empty or None")
-            raw_response = raw_response.strip()
             
             try:
-                data = json.loads(raw_response)
+                data = clean_json_response(raw_response)
                 full_content = data.get("full_content", "")
                 if not full_content:
                     raise ValueError("Content too short or empty")
-                # If the AI explicitly returned "(Can not find the content)" or "None", it is a valid finding, not a parse error
                 if full_content in ["(Can not find the content)", "None"]:
                     return data
                 if len(full_content) < 100:
@@ -555,19 +546,18 @@ def process_with_ai(headline, content, metadata_date=None):
     return None
 
 
-def process_single_item(item):
+def process_single_item(item: Dict[str, Any]) -> Dict[str, Any]:
     headline = item.get('headline', 'Unknown')
     url = item.get('URL')
     
     logger.info(f"🚀 Processing: {headline[:50]}...")
     
     if not is_valid_url(url):
-        logger.info(f"   🚫 Skipped (invalid/blocked URL)")
+        logger.info("   🚫 Skipped (invalid/blocked URL)")
         item['processed_data'] = None
         item['fail_reason'] = "Invalid URL / Blocked Domain"
         return item
 
-    # Try normal scraping first
     scraped_data = scrape_content(url)
     item['url'] = url
     
@@ -577,7 +567,6 @@ def process_single_item(item):
         text_content = scraped_data.get('text', '') if isinstance(scraped_data, dict) else scraped_data
         metadata_date = scraped_data.get('date') if isinstance(scraped_data, dict) else None
     
-    # Check if we got a valid scrape (not empty, not too short, not a bot block message)
     is_valid_scrape = False
     if text_content and len(text_content.strip()) > 300:
         lower_content = text_content.lower()
@@ -598,7 +587,6 @@ def process_single_item(item):
             
         ai_result = process_with_ai(headline, text_content, metadata_date)
 
-    # Fallback to Gemini Grounding Scraper if normal scrape failed, was blocked, or AI returned no content
     if (not ai_result or 
         not ai_result.get('full_content') or 
         len(ai_result['full_content'].strip()) < 100 or 
@@ -616,158 +604,15 @@ def process_single_item(item):
         if not ai_result.get('date_str') and metadata_date:
             ai_result['date_str'] = metadata_date
         if is_old_news(ai_result.get('date_str'), days=OLD_NEWS_DAYS):
-            logger.info(f"   ⏳ Old news detected post-AI")
+            logger.info("   ⏳ Old news detected post-AI")
             ai_result['full_content'] = "(Can not find the content)"
         item['processed_data'] = ai_result
     else:
-        logger.warning(f"   ❌ All scraping and AI fallback options failed")
+        logger.warning("   ❌ All scraping and AI fallback options failed")
         item['processed_data'] = None
         item['fail_reason'] = "Scraping/AI failed"
         
     return item
-
-
-def set_font_style(run, font_name='Times New Roman', size=11, bold=False, italic=False):
-    run.font.name = font_name
-    run.font.size = Pt(size)
-    run.bold = bold
-    run.italic = italic
-    
-    r = run._element
-    rPr = r.get_or_add_rPr()
-    fonts = OxmlElement('w:rFonts')
-    fonts.set(qn('w:ascii'), font_name)
-    fonts.set(qn('w:hAnsi'), font_name)
-    fonts.set(qn('w:eastAsia'), font_name)
-    fonts.set(qn('w:cs'), font_name)
-    rPr.append(fonts)
-
-
-def create_document(news_list, filename):
-    logger.info(f"📄 Generating document: {filename}")
-    doc = Document()
-    success_count = 0
-    failed_count = 0
-    
-    for news in news_list:
-        headline = news.get('headline', 'Untitled')
-        url = news.get('url') or news.get('URL', '')
-        
-        if news.get('processed_data'):
-            data = news['processed_data']
-            
-            p_headline = doc.add_paragraph()
-            run_headline = p_headline.add_run(data.get('cleaned_headline', headline))
-            set_font_style(run_headline, size=12, bold=True)
-            
-            p_date = doc.add_paragraph()
-            run_date = p_date.add_run(f"Date: {data.get('date_str', 'N/A')}")
-            set_font_style(run_date, size=10, italic=True)
-            
-            content = data.get('full_content', '')
-            for para in content.split('\n'):
-                para = para.strip()
-                if para:
-                    p_content = doc.add_paragraph()
-                    p_content.paragraph_format.space_after = Pt(6)
-                    run_content = p_content.add_run(para)
-                    set_font_style(run_content, size=11)
-            
-            if url:
-                p_link = doc.add_paragraph()
-                run_link = p_link.add_run(url)
-                set_font_style(run_link, size=11)
-            
-            success_count += 1
-        else:
-            p_headline = doc.add_paragraph()
-            run_headline = p_headline.add_run(headline)
-            set_font_style(run_headline, size=12, bold=True)
-            
-            p_fail = doc.add_paragraph()
-            run_fail = p_fail.add_run("[Cannot find content]")
-            set_font_style(run_fail, size=11, italic=True)
-            
-            if url:
-                p_link = doc.add_paragraph()
-                run_link = p_link.add_run(url)
-                set_font_style(run_link, size=11)
-                
-            failed_count += 1
-            
-        doc.add_paragraph()
-        
-    doc.save(filename)
-    logger.info(f"✅ Saved to {filename}: {success_count} success, {failed_count} failed")
-    return filename
-
-
-def upload_to_drive(filename):
-    folder_id = os.getenv("DRIVE_FOLDER_ID")
-    creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
-    
-    if not folder_id or not creds_json:
-        logger.warning("Skipping Drive upload: Credentials missing")
-        return None
-
-    logger.info(f"☁️ Uploading to Google Drive: {filename}")
-    try:
-        creds_dict = json.loads(creds_json)
-        creds = service_account.Credentials.from_service_account_info(
-            creds_dict, scopes=['https://www.googleapis.com/auth/drive']
-        )
-        service = build('drive', 'v3', credentials=creds)
-        
-        file_metadata = {'name': filename, 'parents': [folder_id]}
-        media = MediaFileUpload(
-            filename, mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-        )
-        
-        file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-        file_id = file.get('id')
-        logger.info(f"✅ Drive Upload Success! ID={file_id}")
-        return file_id
-    except Exception as e:
-        logger.error(f"Drive upload failed: {e}")
-        return None
-
-
-def send_email(filename, recipient):
-    sender_email = os.getenv("EMAIL_SENDER")
-    sender_password = os.getenv("EMAIL_PASSWORD")
-    
-    if not sender_email or not sender_password:
-        logger.warning("Skipping email: Credentials missing")
-        return False
-
-    logger.info(f"📧 Sending email report to: {recipient}")
-    try:
-        msg = MIMEMultipart()
-        msg['From'] = sender_email
-        msg['To'] = recipient
-        msg['Subject'] = f"Rice News Report: {datetime.now().strftime('%Y-%m-%d')}"
-        
-        body = "Attached is the Daily Rice News Report generated by the automated script."
-        msg.attach(MIMEText(body, 'plain'))
-
-        with open(filename, "rb") as attachment:
-            part = MIMEBase("application", "octet-stream")
-            part.set_payload(attachment.read())
-            
-        encoders.encode_base64(part)
-        part.add_header("Content-Disposition", f"attachment; filename={filename}")
-        msg.attach(part)
-
-        with smtplib.SMTP('smtp.gmail.com', 587) as server:
-            server.starttls()
-            server.login(sender_email, sender_password)
-            server.sendmail(sender_email, recipient, msg.as_string())
-            
-        logger.info("✅ Email sent successfully.")
-        return True
-    except Exception as e:
-        logger.error(f"Email delivery failed: {e}")
-        return False
 
 
 def main():
@@ -797,28 +642,29 @@ def main():
         return
 
     target_headlines = headlines[-7:] if TEST_MODE else headlines
-    logger.info(f"🎯 Processing {len(target_headlines)} items sequentially for stability...")
+    logger.info(f"🎯 Processing {len(target_headlines)} items...")
 
     results = []
     failed_items = []
-    
-    for idx, item in enumerate(target_headlines, 1):
-        try:
-            logger.info(f"\n--- Item [{idx}/{len(target_headlines)}] ---")
-            res = process_single_item(item)
-            results.append(res)
-            
-            if not res.get('processed_data'):
-                reason = res.get('fail_reason', 'Scraping/AI failure')
-                failed_items.append({"headline": item.get('headline'), "reason": reason})
-        except Exception as e:
-            logger.error(f"Error processing item {idx}: {e}")
-            failed_items.append({"headline": item.get('headline'), "reason": f"Fatal Error: {e}"})
 
-    # Cleanup Selenium session
+    # Concurrent processing using ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=CONCURRENT_WORKERS) as executor:
+        future_to_item = {executor.submit(process_single_item, item): item for item in target_headlines}
+        
+        for future in as_completed(future_to_item):
+            item = future_to_item[future]
+            try:
+                res = future.result()
+                results.append(res)
+                if not res.get('processed_data'):
+                    reason = res.get('fail_reason', 'Scraping/AI failure')
+                    failed_items.append({"headline": item.get('headline'), "reason": reason})
+            except Exception as e:
+                logger.error(f"Error processing item {item.get('headline')}: {e}")
+                failed_items.append({"headline": item.get('headline'), "reason": f"Fatal Error: {e}"})
+
     cleanup_selenium()
 
-    # Generate document and outputs
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     output_filename = f"RiceNews_Report_{timestamp}.docx"
     

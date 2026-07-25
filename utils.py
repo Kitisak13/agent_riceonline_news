@@ -5,10 +5,14 @@ import json
 import logging
 import logging.handlers
 import os
+import re
+import tempfile
 import time
-import requests
 from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
+
+import requests
 
 from config import (
     BLOCKED_DOMAINS,
@@ -51,15 +55,51 @@ if not logger.handlers:
     logger.addHandler(file_handler)
 
 
+def save_json_atomic(filepath: str, data: Any, indent: int = 2) -> bool:
+    """
+    Save data to JSON file atomically using a temporary file and os.replace
+    to prevent file corruption during unexpected crashes.
+    """
+    dir_name = os.path.dirname(filepath) or "."
+    os.makedirs(dir_name, exist_ok=True)
+    try:
+        with tempfile.NamedTemporaryFile('w', dir=dir_name, delete=False, encoding='utf-8') as tf:
+            json.dump(data, tf, indent=indent, ensure_ascii=False)
+            temp_name = tf.name
+        os.replace(temp_name, filepath)
+        return True
+    except Exception as e:
+        logger.error(f"Failed atomic write to {filepath}: {e}")
+        if 'temp_name' in locals() and os.path.exists(temp_name):
+            try:
+                os.remove(temp_name)
+            except OSError:
+                pass
+        return False
+
+
+def clean_json_response(raw_text: str) -> Dict[str, Any]:
+    """
+    Clean markdown fences (e.g. ```json ... ```) from LLM output before parsing JSON.
+    """
+    if not raw_text:
+        raise ValueError("Response text is empty or None")
+    
+    cleaned = raw_text.strip()
+    cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\s*```$', '', cleaned)
+    return json.loads(cleaned.strip())
+
+
 class RateLimiter:
     """
     Enforces a delay between API calls to stay within RPM limits.
     """
-    def __init__(self, requests_per_minute=12):
+    def __init__(self, requests_per_minute: float = 12.0):
         self.delay = 60.0 / requests_per_minute
         self.last_call = 0.0
         
-    def wait(self):
+    def wait(self) -> None:
         elapsed = time.time() - self.last_call
         if elapsed < self.delay:
             time.sleep(self.delay - elapsed)
@@ -67,33 +107,33 @@ class RateLimiter:
 
 
 # Global rate limiter instance for Gemini API (12 requests/minute, safe for 15 RPM)
-gemini_limiter = RateLimiter(requests_per_minute=12)
+gemini_limiter = RateLimiter(requests_per_minute=12.0)
 
 
-def parse_date_flexible(date_str):
+def parse_date_flexible(date_str: Optional[str]) -> Optional[datetime]:
     """
     Parse date from various string formats.
     """
     if not date_str:
         return None
     
-    date_str = str(date_str).strip()
+    date_str_clean = str(date_str).strip()
     
     for fmt in DATE_FORMATS:
         try:
-            return datetime.strptime(date_str, fmt)
+            return datetime.strptime(date_str_clean, fmt)
         except ValueError:
             continue
     
     try:
-        return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+        return datetime.fromisoformat(date_str_clean.replace('Z', '+00:00'))
     except ValueError:
         pass
     
     return None
 
 
-def is_old_news(date_str, days=None):
+def is_old_news(date_str: Optional[str], days: Optional[int] = None) -> bool:
     """
     Check if a date is older than X days.
     """
@@ -108,7 +148,7 @@ def is_old_news(date_str, days=None):
     return dt < limit
 
 
-def is_valid_url(url):
+def is_valid_url(url: Optional[str]) -> bool:
     """
     Validate if URL is suitable for news scraping.
     """
@@ -147,14 +187,14 @@ def is_valid_url(url):
     return True
 
 
-def is_blocked_domain(url):
+def is_blocked_domain(url: Optional[str]) -> bool:
     if not url:
         return True
     url_lower = url.lower()
     return any(domain in url_lower for domain in BLOCKED_DOMAINS)
 
 
-def calculate_lookback_days():
+def calculate_lookback_days() -> Tuple[int, str]:
     """
     Calculate lookback days based on current weekday.
     """
@@ -169,7 +209,7 @@ def calculate_lookback_days():
         return 1, "Normal day: Looking at yesterday"
 
 
-def mask_sensitive_value(value, visible_chars=4):
+def mask_sensitive_value(value: Optional[str], visible_chars: int = 4) -> str:
     if not value:
         return "NOT SET"
     if len(value) <= visible_chars * 2:
@@ -177,7 +217,7 @@ def mask_sensitive_value(value, visible_chars=4):
     return f"{value[:visible_chars]}...{value[-visible_chars:]}"
 
 
-def format_duration(seconds):
+def format_duration(seconds: float) -> str:
     if seconds < 60:
         return f"{seconds:.1f}s"
     elif seconds < 3600:
@@ -188,7 +228,7 @@ def format_duration(seconds):
         return f"{hours:.1f}h"
 
 
-def extract_domain(url):
+def extract_domain(url: Optional[str]) -> Optional[str]:
     if not url:
         return None
     try:
@@ -201,7 +241,7 @@ def extract_domain(url):
         return None
 
 
-def requires_selenium(url):
+def requires_selenium(url: Optional[str]) -> bool:
     domain = extract_domain(url)
     if not domain:
         return False
@@ -217,7 +257,7 @@ def requires_selenium(url):
     return False
 
 
-def resolve_google_redirect(url):
+def resolve_google_redirect(url: Optional[str]) -> Optional[str]:
     """
     If the URL is a Google Search Grounding redirect URL, resolve it to the final destination.
     """
@@ -251,23 +291,19 @@ class DomainFailureCache:
             cls._cache = cls._instance._load_cache()
         return cls._instance
     
-    def _load_cache(self):
+    def _load_cache(self) -> Dict[str, Any]:
         if os.path.exists(FAILED_DOMAINS_CACHE_FILE):
             try:
-                with open(FAILED_DOMAINS_CACHE_FILE, 'r') as f:
+                with open(FAILED_DOMAINS_CACHE_FILE, 'r', encoding='utf-8') as f:
                     return json.load(f)
             except (json.JSONDecodeError, IOError):
                 pass
         return {"failures": {}, "selenium_required": []}
     
-    def _save_cache(self):
-        try:
-            with open(FAILED_DOMAINS_CACHE_FILE, 'w') as f:
-                json.dump(self._cache, f, indent=2)
-        except IOError as e:
-            logger.warning(f"Failed to save domain cache: {e}")
+    def _save_cache(self) -> None:
+        save_json_atomic(FAILED_DOMAINS_CACHE_FILE, self._cache)
     
-    def record_failure(self, url):
+    def record_failure(self, url: str) -> None:
         domain = extract_domain(url)
         if not domain:
             return
@@ -282,7 +318,7 @@ class DomainFailureCache:
         
         self._save_cache()
     
-    def record_success(self, url):
+    def record_success(self, url: str) -> None:
         domain = extract_domain(url)
         if not domain:
             return
@@ -291,10 +327,10 @@ class DomainFailureCache:
             del self._cache["failures"][domain]
             self._save_cache()
     
-    def should_use_selenium(self, domain):
+    def should_use_selenium(self, domain: str) -> bool:
         return domain in self._cache.get("selenium_required", [])
     
-    def get_stats(self):
+    def get_stats(self) -> Dict[str, Any]:
         return {
             "domains_with_failures": len(self._cache.get("failures", {})),
             "selenium_required_count": len(self._cache.get("selenium_required", [])),

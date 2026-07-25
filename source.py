@@ -5,6 +5,7 @@ import json
 import os
 import time
 from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
@@ -30,10 +31,11 @@ from utils import (
     gemini_limiter,
     is_valid_url,
     resolve_google_redirect,
+    save_json_atomic,
+    clean_json_response,
 )
 
 # Load environment variables
-# Look for .env first in current folder, then parent
 load_dotenv()
 if not os.getenv("GEMINI_API_KEY"):
     load_dotenv("../.env")
@@ -47,7 +49,6 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 gemini_client = None
 if GEMINI_API_KEY:
     try:
-        # Strip quotes if they were added in .env file
         clean_key = GEMINI_API_KEY.strip().strip('"').strip("'")
         gemini_client = genai.Client(api_key=clean_key)
         logger.info(f"✨ Gemini AI configured successfully with model: {GEMINI_PRIMARY_MODEL}")
@@ -55,7 +56,6 @@ if GEMINI_API_KEY:
         logger.error(f"Failed to configure Gemini: {e}")
         gemini_client = None
 
-# Current year for filtering old URLs
 CURRENT_YEAR = datetime.now().year
 
 # --- API QUOTA TRACKING ---
@@ -66,7 +66,7 @@ API_CALL_COUNT = 0
 HISTORY_FILE = 'processed_history.json'
 
 
-def _load_history():
+def _load_history() -> Dict[str, List[str]]:
     """Load previously processed headlines to detect duplicates across runs."""
     if os.path.exists(HISTORY_FILE):
         try:
@@ -77,29 +77,24 @@ def _load_history():
     return {"processed_headlines": [], "processed_urls": []}
 
 
-def _save_history(history):
-    """Save processed headlines/URLs history to file."""
-    # Keep only last 500 entries to prevent file from growing forever
+def _save_history(history: Dict[str, List[str]]) -> None:
+    """Save processed headlines/URLs history atomically to file."""
     history["processed_headlines"] = history["processed_headlines"][-500:]
     history["processed_urls"] = history["processed_urls"][-500:]
-    try:
-        with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
-            json.dump(history, f, indent=2, ensure_ascii=False)
-    except IOError as e:
-        logger.warning(f"Failed to save history: {e}")
+    save_json_atomic(HISTORY_FILE, history)
 
 
-def _call_google_api_with_retry(params, max_retries=3):
+def _call_google_api_with_retry(params: Dict[str, Any], max_retries: int = 3) -> Optional[Dict[str, Any]]:
     """Call Google Custom Search API with retry logic."""
     global API_CALL_COUNT
     api_url = "https://www.googleapis.com/customsearch/v1"
     
+    if API_CALL_COUNT >= GOOGLE_API_DAILY_LIMIT:
+        logger.error(f"   🚫 Google API quota limit reached ({API_CALL_COUNT}/{GOOGLE_API_DAILY_LIMIT})!")
+        return None
+    
     for retry in range(max_retries):
         try:
-            if API_CALL_COUNT >= GOOGLE_API_DAILY_LIMIT:
-                logger.error(f"   🚫 Google API quota reached ({API_CALL_COUNT}/{GOOGLE_API_DAILY_LIMIT})! Stopping searches.")
-                return None
-            
             response = requests.get(api_url, params=params, timeout=10)
             API_CALL_COUNT += 1
             
@@ -126,9 +121,9 @@ def _call_google_api_with_retry(params, max_retries=3):
     return None
 
 
-def smart_select_url(headline, source, search_items):
+def smart_select_url(headline: str, source: str, search_items: List[Dict[str, Any]]) -> Optional[str]:
     """
-    Use gemini-3.1-flash-lite to select the best URL from search candidates.
+    Use Gemini to select the best URL from search candidates.
     Prioritizes the correct source name.
     """
     if not gemini_client:
@@ -170,7 +165,6 @@ def smart_select_url(headline, source, search_items):
         Return ONLY the raw URL string. If no suitable URL is found, return "None".
         """
         
-        # Enforce rate limiter
         gemini_limiter.wait()
         
         response = gemini_client.models.generate_content(
@@ -190,11 +184,14 @@ def smart_select_url(headline, source, search_items):
         return None
 
 
-def find_real_url(headline, source):
+def find_real_url(headline: str, source: str) -> Optional[str]:
     """
     Search Google Custom Search using an optimized query (clean headline only),
     and ask Gemini to choose the best URL.
     """
+    if API_CALL_COUNT >= GOOGLE_API_DAILY_LIMIT:
+        return None
+
     if not API_KEY or not SEARCH_ENGINE_ID:
         logger.error("Missing GOOGLE_SEARCH_API_KEY or GOOGLE_SEARCH_CX")
         return None
@@ -203,8 +200,6 @@ def find_real_url(headline, source):
     if len(clean_headline) > 100:
         clean_headline = clean_headline[:100]
 
-    # Query formulation: Optimize by searching for the headline directly
-    # This yields much better candidates than forcing strict quote + source queries
     query = clean_headline
 
     params = {
@@ -225,10 +220,11 @@ def find_real_url(headline, source):
     
     # If no results, try relaxed search without date restrict
     if not data or not data.get('items'):
-        logger.info("   ⚠️ No recent results, trying relaxed search...")
-        if 'dateRestrict' in params: del params['dateRestrict']
-        if 'sort' in params: del params['sort']
-        data = _call_google_api_with_retry(params)
+        if API_CALL_COUNT < GOOGLE_API_DAILY_LIMIT:
+            logger.info("   ⚠️ No recent results, trying relaxed search...")
+            if 'dateRestrict' in params: del params['dateRestrict']
+            if 'sort' in params: del params['sort']
+            data = _call_google_api_with_retry(params)
 
     if not data or not data.get('items'):
         logger.warning("   ❌ No search results returned from Google")
@@ -240,7 +236,6 @@ def find_real_url(headline, source):
     selected_url = smart_select_url(headline, source, items)
     
     if selected_url:
-        # If Gemini chose a Google redirect URL, resolve it to get the final target URL
         resolved_url = resolve_google_redirect(selected_url)
         if is_valid_url(resolved_url):
             return resolved_url
@@ -259,7 +254,7 @@ def find_real_url(headline, source):
     return None
 
 
-def scrape_riceonline():
+def scrape_riceonline() -> List[Dict[str, str]]:
     """Main scraping flow for RiceOnline."""
     start_time = time.time()
     
@@ -272,7 +267,6 @@ def scrape_riceonline():
     logger.info(f"🗓️  {lookback_msg}")
     logger.info(f"🗓️  Cutoff date: {cutoff_date.strftime('%Y-%m-%d')}")
     
-    # Fetch RiceOnline homepage
     logger.info(f"🌍 Fetching {RICEONLINE_URL}...")
     headers = {'User-Agent': USER_AGENT}
     try:
@@ -282,15 +276,14 @@ def scrape_riceonline():
         logger.info(f"✅ Page fetched: {len(html):,} bytes")
     except requests.RequestException as e:
         logger.error(f"Failed to fetch homepage: {e}")
-        return
+        return []
 
-    # Parse headlines in accordions
     soup = BeautifulSoup(html, 'html.parser')
     date_divs = soup.find_all('div', class_='accordionButton')
     
     if not date_divs:
         logger.error("No date headers found on page")
-        return
+        return []
 
     candidate_links = []
     
@@ -317,9 +310,8 @@ def scrape_riceonline():
     
     if not candidate_links:
         logger.warning("No candidate items found")
-        return
+        return []
 
-    # Process candidates
     news_list = []
     skipped_count = 0
     duplicate_count = 0
@@ -331,6 +323,10 @@ def scrape_riceonline():
     logger.info(f"📚 Duplicate DB: {len(known_headlines)} headlines tracked")
     
     for i, link in enumerate(candidate_links, 1):
+        if API_CALL_COUNT >= GOOGLE_API_DAILY_LIMIT:
+            logger.warning("🛑 Google Search API daily limit reached! Stopping further searches.")
+            break
+
         raw_text = link.get_text(" ", strip=True)
         
         if '"' not in raw_text:
@@ -343,7 +339,6 @@ def scrape_riceonline():
         source = parts[0].strip()
         headline = parts[1].strip().strip('"').strip()
         
-        # Check duplicate
         headline_key = headline.lower().strip()
         if headline_key in known_headlines:
             duplicate_count += 1
@@ -377,10 +372,8 @@ def scrape_riceonline():
         
         time.sleep(GOOGLE_API_DELAY)
 
-    # Save to source.json
     if news_list:
-        with open(OUTPUT_SOURCE_FILE, 'w', encoding='utf-8') as f:
-            json.dump(news_list, f, indent=2, ensure_ascii=False)
+        save_json_atomic(OUTPUT_SOURCE_FILE, news_list)
         _save_history(history)
         
         duration = format_duration(time.time() - start_time)
@@ -393,6 +386,8 @@ def scrape_riceonline():
         logger.info("=" * 60)
     else:
         logger.warning("No valid news items found to save.")
+
+    return news_list
 
 
 if __name__ == "__main__":
