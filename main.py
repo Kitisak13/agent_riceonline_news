@@ -10,6 +10,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+import re
 from urllib.parse import quote
 
 import requests
@@ -330,11 +331,21 @@ def check_system_health() -> bool:
     return len(missing_keys) == 0
 
 
+# Global circuit breaker flags for API Quota Management
+primary_model_disabled = False
+grounding_fallback_disabled = False
+
+
 def gemini_grounding_fallback_scrape(url: str) -> Optional[Dict[str, str]]:
     """
     Fallback Layer 5: Search Grounding via gemini-2.5-flash
     """
+    global grounding_fallback_disabled
     if not gemini_client:
+        return None
+        
+    if grounding_fallback_disabled:
+        logger.warning("   ⏭️ Gemini Grounding Scraper is disabled for this run (daily quota exhausted).")
         return None
         
     logger.info(f"   🧠 Fallback Layer 5: Attempting Gemini Grounding Scraper for {url[:50]}...")
@@ -377,6 +388,20 @@ def gemini_grounding_fallback_scrape(url: str) -> Optional[Dict[str, str]]:
         return {"text": result_text, "title": "", "date": "", "source": url}
         
     except Exception as e:
+        err_msg = str(e)
+        if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+            is_daily_limit = "RequestsPerDay" in err_msg or "per day" in err_msg.lower()
+            retry_match = re.search(r"Please retry in ([\d\.]+)s", err_msg, re.IGNORECASE)
+            retry_delay = float(retry_match.group(1)) if retry_match else 15.0
+            
+            if is_daily_limit or retry_delay > 60.0:
+                logger.error("   ⚠️ Gemini Grounding Scraper Daily Quota Exhausted! Disabling fallback for this run.")
+                grounding_fallback_disabled = True
+            else:
+                sleep_duration = min(retry_delay + 1.5, 60.0)
+                logger.warning(f"   ⚠️ Fallback Rate limit hit (429). Blocking limiter for {sleep_duration:.2f}s...")
+                gemini_limiter.report_block(sleep_duration)
+                time.sleep(sleep_duration)
         logger.error(f"   ⚠️ Gemini Grounding Scraper Failed: {e}")
         return None
 
@@ -478,7 +503,12 @@ def process_with_ai(headline: str, content: str, metadata_date: Optional[str] = 
     """
     Clean and format content using gemini-3.1-flash-lite with clean JSON parsing.
     """
+    global primary_model_disabled
     if not gemini_client:
+        return None
+        
+    if primary_model_disabled:
+        logger.warning("   ⏭️ Gemini Primary Model is disabled for this run (daily quota exhausted).")
         return None
         
     content_safe = content[:12000]
@@ -540,9 +570,24 @@ def process_with_ai(headline: str, content: str, metadata_date: Optional[str] = 
                 logger.warning(f"   ⚠️ AI attempt {attempt+1} JSON parse error: {je}")
                 
         except Exception as e:
-            logger.warning(f"   ⚠️ AI attempt {attempt+1} failed: {e}")
-            
-        time.sleep(2)
+            err_msg = str(e)
+            if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+                is_daily_limit = "RequestsPerDay" in err_msg or "per day" in err_msg.lower()
+                retry_match = re.search(r"Please retry in ([\d\.]+)s", err_msg, re.IGNORECASE)
+                retry_delay = float(retry_match.group(1)) if retry_match else 15.0
+                
+                if is_daily_limit or retry_delay > 60.0:
+                    logger.error("   ⚠️ Gemini Primary Model Daily Quota Exhausted! Disabling primary model.")
+                    primary_model_disabled = True
+                    break
+                else:
+                    sleep_duration = min(retry_delay + 1.5, 60.0)
+                    logger.warning(f"   ⚠️ Rate limit hit (429). Reporting block of {sleep_duration:.2f}s to limiter...")
+                    gemini_limiter.report_block(sleep_duration)
+                    time.sleep(sleep_duration)
+            else:
+                logger.warning(f"   ⚠️ AI attempt {attempt+1} failed: {e}")
+                time.sleep(2)
         
     return None
 

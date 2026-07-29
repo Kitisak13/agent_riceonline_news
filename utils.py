@@ -91,19 +91,32 @@ def clean_json_response(raw_text: str) -> Dict[str, Any]:
     return json.loads(cleaned.strip())
 
 
+import threading
+
 class RateLimiter:
     """
-    Enforces a delay between API calls to stay within RPM limits.
+    Enforces a delay between API calls to stay within RPM limits. Thread-safe.
     """
     def __init__(self, requests_per_minute: float = 12.0):
         self.delay = 60.0 / requests_per_minute
         self.last_call = 0.0
+        self.lock = threading.Lock()
         
     def wait(self) -> None:
-        elapsed = time.time() - self.last_call
-        if elapsed < self.delay:
-            time.sleep(self.delay - elapsed)
-        self.last_call = time.time()
+        with self.lock:
+            now = time.time()
+            elapsed = now - self.last_call
+            if elapsed < self.delay:
+                sleep_time = self.delay - elapsed
+                time.sleep(sleep_time)
+            self.last_call = time.time()
+
+    def report_block(self, duration: float) -> None:
+        """
+        Force a block duration (e.g. from a 429 error) during which all threads must wait.
+        """
+        with self.lock:
+            self.last_call = time.time() + duration - self.delay
 
 
 # Global rate limiter instance for Gemini API (12 requests/minute, safe for 15 RPM)
