@@ -717,32 +717,36 @@ def main():
             # Atomic checkpoint save to prevent data loss
             save_json_atomic(CHECKPOINT_FILE, results)
 
+    executor = ThreadPoolExecutor(max_workers=CONCURRENT_WORKERS)
     try:
-        # Concurrent processing using ThreadPoolExecutor with timeout
-        with ThreadPoolExecutor(max_workers=CONCURRENT_WORKERS) as executor:
-            future_to_item = {executor.submit(process_single_item, item): item for item in target_headlines}
-            
-            for future in as_completed(future_to_item):
-                item = future_to_item[future]
-                try:
-                    res = future.result(timeout=ITEM_PROCESSING_TIMEOUT)
-                    record_progress(res)
-                except (TimeoutError, Exception) as e:
-                    is_timeout = isinstance(e, TimeoutError) or "TimeoutError" in type(e).__name__
-                    if is_timeout:
-                        logger.error(f"⏳ Timeout ({ITEM_PROCESSING_TIMEOUT}s) processing item: {item.get('headline')}")
-                        fail_reason = f"Timeout exceeded ({ITEM_PROCESSING_TIMEOUT}s)"
-                    else:
-                        logger.error(f"Error processing item {item.get('headline')}: {e}")
-                        fail_reason = f"Fatal Error: {e}"
-                    
-                    fallback_item = {
-                        **item,
-                        'processed_data': None,
-                        'fail_reason': fail_reason
-                    }
-                    record_progress(fallback_item, fail_reason)
+        # Concurrent processing using ThreadPoolExecutor with strict timeout
+        future_to_item = {executor.submit(process_single_item, item): item for item in target_headlines}
+        
+        for future, item in future_to_item.items():
+            try:
+                res = future.result(timeout=ITEM_PROCESSING_TIMEOUT)
+                record_progress(res)
+            except Exception as e:
+                is_timeout = isinstance(e, TimeoutError) or "Timeout" in type(e).__name__
+                if is_timeout:
+                    logger.error(f"⏳ Timeout ({ITEM_PROCESSING_TIMEOUT}s) processing item: {item.get('headline', '')[:35]}")
+                    fail_reason = f"Timeout exceeded ({ITEM_PROCESSING_TIMEOUT}s)"
+                else:
+                    logger.error(f"Error processing item {item.get('headline', '')[:35]}: {e}")
+                    fail_reason = f"Fatal Error: {e}"
+                
+                fallback_item = {
+                    **item,
+                    'processed_data': None,
+                    'fail_reason': fail_reason
+                }
+                record_progress(fallback_item, fail_reason)
     finally:
+        # Non-blocking executor shutdown with cancellation to prevent hangs
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
         cleanup_selenium()
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M")
