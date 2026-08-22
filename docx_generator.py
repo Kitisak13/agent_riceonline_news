@@ -79,13 +79,15 @@ def create_document(news_list: List[Dict[str, Any]], filename: str) -> str:
             run_headline = p_headline.add_run(headline)
             set_font_style(run_headline, size=12, bold=True)
             
+            fail_reason = news.get('fail_reason')
+            fail_text = f"[Cannot find content - {fail_reason}]" if fail_reason else "[Cannot find content]"
             p_fail = doc.add_paragraph()
-            run_fail = p_fail.add_run("[Cannot find content]")
+            run_fail = p_fail.add_run(fail_text)
             set_font_style(run_fail, size=11, italic=True)
             
             if url:
                 p_link = doc.add_paragraph()
-                run_link = p_link.add_run(url)
+                run_link = p_link.add_run(f"Source URL: {url}")
                 set_font_style(run_link, size=11)
                 
             failed_count += 1

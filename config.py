@@ -25,6 +25,9 @@ GEMINI_PRIMARY_MODEL = "gemini-3.1-flash-lite"
 GEMINI_FALLBACK_MODEL = "gemini-2.5-flash"
 
 GEMINI_API_DELAY = 5.0  # Delay between Gemini API calls to respect 15 RPM
+GEMINI_TIMEOUT = 25.0  # seconds timeout for each Gemini API call
+ITEM_PROCESSING_TIMEOUT = 90.0  # seconds maximum timeout per news item
+CHECKPOINT_FILE = os.path.join(DATA_DIR, "checkpoint_results.json")
 MAX_RETRIES = 3
 OLD_NEWS_DAYS = 10  # Filter out news older than X days
 

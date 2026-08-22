@@ -7,7 +7,7 @@ import os
 import random
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 import re
@@ -43,6 +43,9 @@ from config import (
     MAX_RETRIES,
     GEMINI_PRIMARY_MODEL,
     GEMINI_FALLBACK_MODEL,
+    GEMINI_TIMEOUT,
+    ITEM_PROCESSING_TIMEOUT,
+    CHECKPOINT_FILE,
     OLD_NEWS_DAYS,
     PAGE_LOAD_TIMEOUT,
     REQUIRED_ENV_KEYS,
@@ -60,6 +63,7 @@ from utils import (
     logger,
     mask_sensitive_value,
     requires_selenium,
+    save_json_atomic,
 )
 
 # Load environment variables
@@ -366,7 +370,8 @@ def gemini_grounding_fallback_scrape(url: str) -> Optional[Dict[str, str]]:
         gemini_limiter.wait()
         
         config = types.GenerateContentConfig(
-            tools=[types.Tool(google_search=types.GoogleSearch())]
+            tools=[types.Tool(google_search=types.GoogleSearch())],
+            http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT),
         )
         
         response = gemini_client.models.generate_content(
@@ -549,6 +554,7 @@ def process_with_ai(headline: str, content: str, metadata_date: Optional[str] = 
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     temperature=0.1,
+                    http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT),
                 )
             )
             
@@ -692,50 +698,70 @@ def main():
 
     results = []
     failed_items = []
+    checkpoint_lock = threading.Lock()
 
-    # Concurrent processing using ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=CONCURRENT_WORKERS) as executor:
-        future_to_item = {executor.submit(process_single_item, item): item for item in target_headlines}
+    def record_progress(item_res, error_reason=None):
+        with checkpoint_lock:
+            results.append(item_res)
+            if not item_res.get('processed_data'):
+                reason = error_reason or item_res.get('fail_reason', 'Scraping/AI failure')
+                failed_items.append({"headline": item_res.get('headline'), "reason": reason})
+            # Atomic checkpoint save to prevent data loss
+            save_json_atomic(CHECKPOINT_FILE, results)
+
+    try:
+        # Concurrent processing using ThreadPoolExecutor with timeout
+        with ThreadPoolExecutor(max_workers=CONCURRENT_WORKERS) as executor:
+            future_to_item = {executor.submit(process_single_item, item): item for item in target_headlines}
+            
+            for future in as_completed(future_to_item):
+                item = future_to_item[future]
+                try:
+                    res = future.result(timeout=ITEM_PROCESSING_TIMEOUT)
+                    record_progress(res)
+                except (TimeoutError, Exception) as e:
+                    is_timeout = isinstance(e, TimeoutError) or "TimeoutError" in type(e).__name__
+                    if is_timeout:
+                        logger.error(f"⏳ Timeout ({ITEM_PROCESSING_TIMEOUT}s) processing item: {item.get('headline')}")
+                        fail_reason = f"Timeout exceeded ({ITEM_PROCESSING_TIMEOUT}s)"
+                    else:
+                        logger.error(f"Error processing item {item.get('headline')}: {e}")
+                        fail_reason = f"Fatal Error: {e}"
+                    
+                    fallback_item = {
+                        **item,
+                        'processed_data': None,
+                        'fail_reason': fail_reason
+                    }
+                    record_progress(fallback_item, fail_reason)
+    finally:
+        cleanup_selenium()
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+        output_filename = f"RiceNews_Report_{timestamp}.docx"
         
-        for future in as_completed(future_to_item):
-            item = future_to_item[future]
-            try:
-                res = future.result()
-                results.append(res)
-                if not res.get('processed_data'):
-                    reason = res.get('fail_reason', 'Scraping/AI failure')
-                    failed_items.append({"headline": item.get('headline'), "reason": reason})
-            except Exception as e:
-                logger.error(f"Error processing item {item.get('headline')}: {e}")
-                failed_items.append({"headline": item.get('headline'), "reason": f"Fatal Error: {e}"})
+        if results:
+            create_document(results, output_filename)
+            upload_to_drive(output_filename)
+            target_email = os.getenv("EMAIL_SENDER")
+            if target_email:
+                send_email(output_filename, target_email)
+        else:
+            logger.warning("No articles processed successfully.")
 
-    cleanup_selenium()
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-    output_filename = f"RiceNews_Report_{timestamp}.docx"
-    
-    if results:
-        create_document(results, output_filename)
-        upload_to_drive(output_filename)
-        target_email = os.getenv("EMAIL_SENDER")
-        if target_email:
-            send_email(output_filename, target_email)
-    else:
-        logger.warning("No articles processed successfully.")
-
-    duration = format_duration(time.time() - start_time)
-    logger.info("\n" + "=" * 60)
-    logger.info("🎉 COMPLETE - Summary Report V1")
-    logger.info(f"⏱️  Total time: {duration}")
-    logger.info(f"✅ Success: {len(results) - len(failed_items)} articles")
-    logger.info(f"❌ Failed: {len(failed_items)} articles")
-    
-    if failed_items:
-        logger.info("-" * 30)
-        logger.info("LIST OF FAILED ITEMS:")
-        for idx, f in enumerate(failed_items, 1):
-            logger.info(f" {idx}. {f['headline'][:50]}... (Reason: {f['reason']})")
-    logger.info("=" * 60)
+        duration = format_duration(time.time() - start_time)
+        logger.info("\n" + "=" * 60)
+        logger.info("🎉 COMPLETE - Summary Report V1")
+        logger.info(f"⏱️  Total time: {duration}")
+        logger.info(f"✅ Success: {len(results) - len(failed_items)} articles")
+        logger.info(f"❌ Failed: {len(failed_items)} articles")
+        
+        if failed_items:
+            logger.info("-" * 30)
+            logger.info("LIST OF FAILED ITEMS:")
+            for idx, f in enumerate(failed_items, 1):
+                logger.info(f" {idx}. {f['headline'][:50]}... (Reason: {f['reason']})")
+        logger.info("=" * 60)
 
 
 if __name__ == "__main__":

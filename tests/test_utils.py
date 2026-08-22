@@ -79,6 +79,17 @@ class TestUtils(unittest.TestCase):
                 loaded = json.load(f)
             self.assertEqual(loaded, test_data)
 
+    def test_rate_limiter_scheduled_slots(self):
+        from utils import RateLimiter
+        import time
+        limiter = RateLimiter(requests_per_minute=600.0)  # 0.1s delay
+        start = time.time()
+        limiter.wait()
+        limiter.wait()
+        duration = time.time() - start
+        self.assertGreaterEqual(duration, 0.08)
+
 
 if __name__ == "__main__":
     unittest.main()
+

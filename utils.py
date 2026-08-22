@@ -95,28 +95,33 @@ import threading
 
 class RateLimiter:
     """
-    Enforces a delay between API calls to stay within RPM limits. Thread-safe.
+    Enforces a delay between API calls to stay within RPM limits.
+    Uses thread-safe slot reservation so threads do not block each other while sleeping.
     """
     def __init__(self, requests_per_minute: float = 12.0):
         self.delay = 60.0 / requests_per_minute
-        self.last_call = 0.0
+        self.next_available_time = 0.0
         self.lock = threading.Lock()
         
     def wait(self) -> None:
         with self.lock:
             now = time.time()
-            elapsed = now - self.last_call
-            if elapsed < self.delay:
-                sleep_time = self.delay - elapsed
-                time.sleep(sleep_time)
-            self.last_call = time.time()
+            # If the next available time is in the past, schedule immediately
+            target_time = max(now, self.next_available_time)
+            # Reserve next slot
+            self.next_available_time = target_time + self.delay
+            sleep_duration = target_time - now
+
+        if sleep_duration > 0:
+            time.sleep(sleep_duration)
 
     def report_block(self, duration: float) -> None:
         """
-        Force a block duration (e.g. from a 429 error) during which all threads must wait.
+        Force a block duration (e.g. from a 429 error) during which future requests are delayed.
         """
         with self.lock:
-            self.last_call = time.time() + duration - self.delay
+            now = time.time()
+            self.next_available_time = max(self.next_available_time, now + duration)
 
 
 # Global rate limiter instance for Gemini API (12 requests/minute, safe for 15 RPM)
