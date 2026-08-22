@@ -25,6 +25,7 @@ from config import (
     GOOGLE_API_RESULTS,
     GEMINI_PRIMARY_MODEL,
     GEMINI_FALLBACK_MODEL,
+    GEMINI_TIMEOUT,
     USER_AGENT,
     DATA_DIR,
 )
@@ -266,7 +267,10 @@ def smart_select_url(headline: str, source: str, search_items: List[Dict[str, An
         
         response = gemini_client.models.generate_content(
             model=GEMINI_PRIMARY_MODEL,
-            contents=prompt
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT)
+            )
         )
         
         selected_url = response.text.strip().replace("```", "").strip()
@@ -301,7 +305,8 @@ def gemini_direct_grounding_search(headline: str, source: str) -> Optional[str]:
     try:
         gemini_limiter.wait()
         config = types.GenerateContentConfig(
-            tools=[types.Tool(google_search=types.GoogleSearch())]
+            tools=[types.Tool(google_search=types.GoogleSearch())],
+            http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT)
         )
         response = gemini_client.models.generate_content(
             model=GEMINI_FALLBACK_MODEL,
