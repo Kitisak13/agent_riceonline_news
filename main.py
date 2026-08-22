@@ -25,7 +25,7 @@ from notifier import send_email, upload_to_drive
 
 # Try importing curl_cffi for Cloudflare bypass, fallback to None
 try:
-    import curl_cffi.requests as curl_requests
+    import curl_cffi.requests as curl_requests  # type: ignore
     logger_curl = True
 except ImportError:
     curl_requests = None
