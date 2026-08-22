@@ -696,6 +696,10 @@ def main():
     target_headlines = headlines[-7:] if TEST_MODE else headlines
     logger.info(f"🎯 Processing {len(target_headlines)} items...")
 
+    # Preserve original sequence order from source.json
+    for idx, item in enumerate(target_headlines):
+        item['_original_index'] = idx
+
     results = []
     failed_items = []
     checkpoint_lock = threading.Lock()
@@ -705,7 +709,11 @@ def main():
             results.append(item_res)
             if not item_res.get('processed_data'):
                 reason = error_reason or item_res.get('fail_reason', 'Scraping/AI failure')
-                failed_items.append({"headline": item_res.get('headline'), "reason": reason})
+                failed_items.append({
+                    "headline": item_res.get('headline'),
+                    "reason": reason,
+                    "_original_index": item_res.get('_original_index', 0)
+                })
             # Atomic checkpoint save to prevent data loss
             save_json_atomic(CHECKPOINT_FILE, results)
 
@@ -741,6 +749,8 @@ def main():
         output_filename = f"RiceNews_Report_{timestamp}.docx"
         
         if results:
+            # Sort results to match exact order in source.json
+            results.sort(key=lambda x: x.get('_original_index', 0))
             create_document(results, output_filename)
             upload_to_drive(output_filename)
             target_email = os.getenv("EMAIL_SENDER")
@@ -757,6 +767,7 @@ def main():
         logger.info(f"❌ Failed: {len(failed_items)} articles")
         
         if failed_items:
+            failed_items.sort(key=lambda x: x.get('_original_index', 0))
             logger.info("-" * 30)
             logger.info("LIST OF FAILED ITEMS:")
             for idx, f in enumerate(failed_items, 1):
