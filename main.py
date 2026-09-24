@@ -75,7 +75,7 @@ if not os.getenv("GEMINI_API_KEY") and not os.getenv("OPEN_ROUTER_API_KEY"):
     load_dotenv("../.env")
 
 INPUT_FILE = 'source.json'
-TEST_MODE = False  # Set to True for testing 5 items
+TEST_MODE = False  # Set to True for quick verification (5 items)
 CONCURRENT_WORKERS = 4  # Concurrent workers for HTTP scraping
 
 # User agent rotation
@@ -350,6 +350,8 @@ def check_system_health() -> bool:
 # Global circuit breaker flags for API Quota Management
 primary_model_disabled = False
 grounding_fallback_disabled = False
+circuit_lock = threading.Lock()
+gemini_503_failures = 0
 
 
 def gemini_grounding_fallback_scrape(url: str) -> Optional[Dict[str, str]]:
@@ -511,7 +513,7 @@ def process_with_ai(headline: str, content: str, metadata_date: Optional[str] = 
     """
     Clean and format content using Gemini (Primary) with OpenRouter GPT-4o-mini (Backup).
     """
-    global primary_model_disabled
+    global primary_model_disabled, gemini_503_failures
     content_safe = content[:12000]
     date_context = f"Metadata Date: {metadata_date}" if metadata_date else "No metadata date."
     
@@ -592,9 +594,18 @@ def process_with_ai(headline: str, content: str, metadata_date: Optional[str] = 
                         logger.warning(f"   ⚠️ Gemini Rate limit hit (429). Waiting {sleep_duration:.2f}s...")
                         gemini_limiter.report_block(sleep_duration)
                         time.sleep(sleep_duration)
+                elif any(k in err_msg for k in ["500", "502", "503", "504", "DEADLINE_EXCEEDED", "UNAVAILABLE", "high demand"]):
+                    logger.warning(f"   ⚠️ Gemini Server Overload/Error ({err_msg[:80]}...)")
+                    with circuit_lock:
+                        gemini_503_failures += 1
+                        if gemini_503_failures >= 2:
+                            logger.error("   🚨 Gemini Server Overload threshold reached! Tripping circuit breaker -> Routing all items directly to OpenRouter.")
+                            primary_model_disabled = True
+                    # Immediate failover: do NOT waste time retrying 5xx on Gemini!
+                    break
                 else:
                     logger.warning(f"   ⚠️ Gemini attempt {attempt+1} failed: {e}")
-                    time.sleep(2)
+                    time.sleep(1)
 
     # =========================================================================
     # 2. BACKUP AI: OPENROUTER (GPT-4o-mini)

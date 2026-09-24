@@ -23,7 +23,7 @@ PAGE_LOAD_TIMEOUT = 20  # seconds
 GEMINI_PRIMARY_MODEL = "gemini-3.1-flash-lite"
 GEMINI_FALLBACK_MODEL = "gemini-3.5-flash-lite"
 GEMINI_API_DELAY = 5.0  # Delay between Gemini API calls to respect 15 RPM
-GEMINI_TIMEOUT = 30000  # Timeout for Gemini API calls in milliseconds (30 seconds)
+GEMINI_TIMEOUT = 12000  # Timeout for Gemini API calls in milliseconds (12 seconds fast-fail)
 
 # Backup AI: OpenRouter (OpenAI GPT-4o-mini fallback)
 OPENROUTER_MODEL = "openai/gpt-4o-mini"
@@ -31,7 +31,7 @@ OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 AI_TIMEOUT = 30  # seconds timeout for HTTP AI calls
 AI_DELAY = 1.0  # seconds between calls
 
-ITEM_PROCESSING_TIMEOUT = 60.0  # seconds maximum timeout per news item
+ITEM_PROCESSING_TIMEOUT = 120.0  # seconds maximum timeout per news item (allows Selenium + fallback)
 CHECKPOINT_FILE = os.path.join(DATA_DIR, "checkpoint_results.json")
 MAX_RETRIES = 3
 OLD_NEWS_DAYS = 10  # Filter out news older than X days
