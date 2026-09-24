@@ -44,6 +44,9 @@ from config import (
     GEMINI_PRIMARY_MODEL,
     GEMINI_FALLBACK_MODEL,
     GEMINI_TIMEOUT,
+    OPENROUTER_MODEL,
+    OPENROUTER_API_URL,
+    AI_TIMEOUT,
     ITEM_PROCESSING_TIMEOUT,
     CHECKPOINT_FILE,
     OLD_NEWS_DAYS,
@@ -68,11 +71,11 @@ from utils import (
 
 # Load environment variables
 load_dotenv()
-if not os.getenv("GEMINI_API_KEY"):
+if not os.getenv("GEMINI_API_KEY") and not os.getenv("OPEN_ROUTER_API_KEY"):
     load_dotenv("../.env")
 
 INPUT_FILE = 'source.json'
-TEST_MODE = False
+TEST_MODE = False  # Set to True for testing 5 items
 CONCURRENT_WORKERS = 4  # Concurrent workers for HTTP scraping
 
 # User agent rotation
@@ -92,15 +95,24 @@ def get_google_cache_url(url: str) -> str:
     return f"https://webcache.googleusercontent.com/search?q=cache:{quote(url)}"
 
 
-# Configure Gemini Client
+# --- AI CLIENT SETUP ---
+# Primary AI: Gemini Client
 gemini_client = None
 if os.getenv("GEMINI_API_KEY"):
     try:
         clean_key = os.getenv("GEMINI_API_KEY").strip().strip('"').strip("'")
         gemini_client = genai.Client(api_key=clean_key)
-        logger.info("✨ Gemini Client configured for editing and fallbacks.")
+        logger.info(f"✨ Gemini Client configured as Primary AI (Model: {GEMINI_PRIMARY_MODEL})")
     except Exception as e:
         logger.error(f"Failed to configure Gemini: {e}")
+
+# Backup AI: OpenRouter (GPT-4o-mini)
+OPEN_ROUTER_API_KEY = os.getenv("OPEN_ROUTER_API_KEY")
+if OPEN_ROUTER_API_KEY:
+    OPEN_ROUTER_API_KEY = OPEN_ROUTER_API_KEY.strip().strip('"').strip("'")
+    logger.info(f"✨ OpenRouter configured as Backup AI (Model: {OPENROUTER_MODEL})")
+else:
+    logger.warning("⚠️ OPEN_ROUTER_API_KEY not found in environment (Backup AI disabled).")
 
 
 # ==============================================================================
@@ -342,14 +354,14 @@ grounding_fallback_disabled = False
 
 def gemini_grounding_fallback_scrape(url: str) -> Optional[Dict[str, str]]:
     """
-    Fallback Layer 5: Search Grounding via gemini-2.5-flash
+    Fallback Layer 5: Search Grounding via Gemini.
     """
     global grounding_fallback_disabled
     if not gemini_client:
         return None
         
     if grounding_fallback_disabled:
-        logger.warning("   ⏭️ Gemini Grounding Scraper is disabled for this run (daily quota exhausted).")
+        logger.warning("   ⏭️ Gemini Grounding Scraper is disabled for this run (quota limit).")
         return None
         
     logger.info(f"   🧠 Fallback Layer 5: Attempting Gemini Grounding Scraper for {url[:50]}...")
@@ -395,19 +407,10 @@ def gemini_grounding_fallback_scrape(url: str) -> Optional[Dict[str, str]]:
     except Exception as e:
         err_msg = str(e)
         if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-            is_daily_limit = "RequestsPerDay" in err_msg or "per day" in err_msg.lower()
-            retry_match = re.search(r"Please retry in ([\d\.]+)s", err_msg, re.IGNORECASE)
-            retry_delay = float(retry_match.group(1)) if retry_match else 15.0
-            
-            if is_daily_limit or retry_delay > 60.0:
-                logger.error("   ⚠️ Gemini Grounding Scraper Daily Quota Exhausted! Disabling fallback for this run.")
-                grounding_fallback_disabled = True
-            else:
-                sleep_duration = min(retry_delay + 1.5, 60.0)
-                logger.warning(f"   ⚠️ Fallback Rate limit hit (429). Blocking limiter for {sleep_duration:.2f}s...")
-                gemini_limiter.report_block(sleep_duration)
-                time.sleep(sleep_duration)
-        logger.error(f"   ⚠️ Gemini Grounding Scraper Failed: {e}")
+            logger.warning("   ⚠️ Gemini Grounding Scraper Quota Exhausted! Disabling grounding fallback for this run.")
+            grounding_fallback_disabled = True
+        else:
+            logger.error(f"   ⚠️ Gemini Grounding Scraper Failed: {e}")
         return None
 
 
@@ -506,16 +509,9 @@ def scrape_content(url: str) -> Optional[Any]:
 
 def process_with_ai(headline: str, content: str, metadata_date: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """
-    Clean and format content using gemini-3.1-flash-lite with clean JSON parsing.
+    Clean and format content using Gemini (Primary) with OpenRouter GPT-4o-mini (Backup).
     """
     global primary_model_disabled
-    if not gemini_client:
-        return None
-        
-    if primary_model_disabled:
-        logger.warning("   ⏭️ Gemini Primary Model is disabled for this run (daily quota exhausted).")
-        return None
-        
     content_safe = content[:12000]
     date_context = f"Metadata Date: {metadata_date}" if metadata_date else "No metadata date."
     
@@ -543,56 +539,114 @@ def process_with_ai(headline: str, content: str, metadata_date: Optional[str] = 
       "date_str": "YYYY-MM-DD or null"
     }}"""
 
-    for attempt in range(MAX_RETRIES):
-        try:
-            logger.debug(f"   🤖 AI Call (attempt {attempt+1}/3)...")
-            gemini_limiter.wait()
-            
-            response = gemini_client.models.generate_content(
-                model=GEMINI_PRIMARY_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.1,
-                    http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT),
-                )
-            )
-            
-            raw_response = response.text
-            if not raw_response:
-                raise ValueError("Response text is empty or None")
-            
+    # =========================================================================
+    # 1. PRIMARY AI: GEMINI
+    # =========================================================================
+    gemini_succeeded = False
+    if gemini_client and not primary_model_disabled:
+        for attempt in range(MAX_RETRIES):
             try:
-                data = clean_json_response(raw_response)
-                full_content = data.get("full_content", "")
-                if not full_content:
-                    raise ValueError("Content too short or empty")
-                if full_content in ["(Can not find the content)", "None"]:
+                logger.debug(f"   🤖 Gemini Call (attempt {attempt+1}/{MAX_RETRIES})...")
+                gemini_limiter.wait()
+                
+                response = gemini_client.models.generate_content(
+                    model=GEMINI_PRIMARY_MODEL,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0.1,
+                        http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT),
+                    )
+                )
+                
+                raw_response = response.text
+                if not raw_response:
+                    raise ValueError("Response text is empty or None")
+                
+                try:
+                    data = clean_json_response(raw_response)
+                    full_content = data.get("full_content", "")
+                    if not full_content:
+                        raise ValueError("Content too short or empty")
+                    if full_content in ["(Can not find the content)", "None"]:
+                        return data
+                    if len(full_content) < 100:
+                        raise ValueError("Content too short")
                     return data
-                if len(full_content) < 100:
-                    raise ValueError("Content too short")
-                return data
-            except (json.JSONDecodeError, ValueError) as je:
-                logger.warning(f"   ⚠️ AI attempt {attempt+1} JSON parse error: {je}")
-                
-        except Exception as e:
-            err_msg = str(e)
-            if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-                is_daily_limit = "RequestsPerDay" in err_msg or "per day" in err_msg.lower()
-                retry_match = re.search(r"Please retry in ([\d\.]+)s", err_msg, re.IGNORECASE)
-                retry_delay = float(retry_match.group(1)) if retry_match else 15.0
-                
-                if is_daily_limit or retry_delay > 60.0:
-                    logger.error("   ⚠️ Gemini Primary Model Daily Quota Exhausted! Disabling primary model.")
-                    primary_model_disabled = True
-                    break
+                except (json.JSONDecodeError, ValueError) as je:
+                    logger.warning(f"   ⚠️ Gemini attempt {attempt+1} JSON parse error: {je}")
+                    
+            except Exception as e:
+                err_msg = str(e)
+                if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+                    is_daily_limit = "RequestsPerDay" in err_msg or "per day" in err_msg.lower()
+                    retry_match = re.search(r"Please retry in ([\d\.]+)s", err_msg, re.IGNORECASE)
+                    retry_delay = float(retry_match.group(1)) if retry_match else 15.0
+                    
+                    if is_daily_limit or retry_delay > 60.0:
+                        logger.error("   ⚠️ Gemini Primary Model Daily Quota Exhausted! Disabling primary model.")
+                        primary_model_disabled = True
+                        break
+                    else:
+                        sleep_duration = min(retry_delay + 1.5, 60.0)
+                        logger.warning(f"   ⚠️ Gemini Rate limit hit (429). Waiting {sleep_duration:.2f}s...")
+                        gemini_limiter.report_block(sleep_duration)
+                        time.sleep(sleep_duration)
                 else:
-                    sleep_duration = min(retry_delay + 1.5, 60.0)
-                    logger.warning(f"   ⚠️ Rate limit hit (429). Reporting block of {sleep_duration:.2f}s to limiter...")
-                    gemini_limiter.report_block(sleep_duration)
-                    time.sleep(sleep_duration)
-            else:
-                logger.warning(f"   ⚠️ AI attempt {attempt+1} failed: {e}")
+                    logger.warning(f"   ⚠️ Gemini attempt {attempt+1} failed: {e}")
+                    time.sleep(2)
+
+    # =========================================================================
+    # 2. BACKUP AI: OPENROUTER (GPT-4o-mini)
+    # =========================================================================
+    if OPEN_ROUTER_API_KEY:
+        logger.info("   🔄 Gemini failed or unavailable. Falling back to OpenRouter (openai/gpt-4o-mini)...")
+        headers = {
+            "Authorization": f"Bearer {OPEN_ROUTER_API_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/agent_riceonline_news",
+            "X-Title": "Rice News Aggregator",
+        }
+        payload = {
+            "model": OPENROUTER_MODEL,
+            "messages": [
+                {"role": "user", "content": prompt}
+            ],
+            "response_format": {"type": "json_object"},
+            "temperature": 0.1,
+        }
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                logger.debug(f"   🤖 OpenRouter Call (attempt {attempt+1}/{MAX_RETRIES})...")
+                gemini_limiter.wait()
+                
+                resp = requests.post(OPENROUTER_API_URL, headers=headers, json=payload, timeout=AI_TIMEOUT)
+                if resp.status_code != 200:
+                    logger.warning(f"   ⚠️ OpenRouter HTTP {resp.status_code}: {resp.text[:150]}")
+                    time.sleep(2)
+                    continue
+                    
+                resp_data = resp.json()
+                raw_response = resp_data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                if not raw_response:
+                    raise ValueError("Response text is empty or None")
+                
+                try:
+                    data = clean_json_response(raw_response)
+                    full_content = data.get("full_content", "")
+                    if not full_content:
+                        raise ValueError("Content too short or empty")
+                    if full_content in ["(Can not find the content)", "None"]:
+                        return data
+                    if len(full_content) < 100:
+                        raise ValueError("Content too short")
+                    return data
+                except (json.JSONDecodeError, ValueError) as je:
+                    logger.warning(f"   ⚠️ OpenRouter attempt {attempt+1} JSON parse error: {je}")
+                    
+            except Exception as e:
+                logger.warning(f"   ⚠️ OpenRouter attempt {attempt+1} failed: {e}")
                 time.sleep(2)
         
     return None
@@ -677,8 +731,8 @@ def main():
     if not check_system_health():
         logger.warning("Some environment variables are missing. Proceeding with caution.")
         
-    if not gemini_client:
-        logger.critical("AI Client failed to load. Aborting.")
+    if not gemini_client and not OPEN_ROUTER_API_KEY:
+        logger.critical("No AI Client (neither Gemini nor OpenRouter) is available. Aborting.")
         return
 
     if not os.path.exists(INPUT_FILE):
@@ -693,7 +747,7 @@ def main():
         logger.critical(f"Failed to read {INPUT_FILE}: {e}")
         return
 
-    target_headlines = headlines[-7:] if TEST_MODE else headlines
+    target_headlines = headlines[:5] if TEST_MODE else headlines
     logger.info(f"🎯 Processing {len(target_headlines)} items...")
 
     # Preserve original sequence order from source.json

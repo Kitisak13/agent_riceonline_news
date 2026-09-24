@@ -19,13 +19,18 @@ SELENIUM_WAIT_TIMEOUT = 20  # seconds
 PAGE_LOAD_TIMEOUT = 20  # seconds
 
 # --- AI & PROCESSING CONFIG ---
-# Primary model for text selection and cleaning (15 RPM, 500 RPD)
+# Primary AI: Gemini Model (15 RPM, 500 RPD)
 GEMINI_PRIMARY_MODEL = "gemini-3.1-flash-lite"
-# Fallback model for search grounding / Cloudflare bypass (5 RPM, 20 RPD)
-GEMINI_FALLBACK_MODEL = "gemini-2.5-flash"
-
+GEMINI_FALLBACK_MODEL = "gemini-3.5-flash-lite"
 GEMINI_API_DELAY = 5.0  # Delay between Gemini API calls to respect 15 RPM
-GEMINI_TIMEOUT = 30000  # Timeout for Gemini API calls in milliseconds (30,000 ms = 30 seconds)
+GEMINI_TIMEOUT = 30000  # Timeout for Gemini API calls in milliseconds (30 seconds)
+
+# Backup AI: OpenRouter (OpenAI GPT-4o-mini fallback)
+OPENROUTER_MODEL = "openai/gpt-4o-mini"
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+AI_TIMEOUT = 30  # seconds timeout for HTTP AI calls
+AI_DELAY = 1.0  # seconds between calls
+
 ITEM_PROCESSING_TIMEOUT = 60.0  # seconds maximum timeout per news item
 CHECKPOINT_FILE = os.path.join(DATA_DIR, "checkpoint_results.json")
 MAX_RETRIES = 3
@@ -70,6 +75,7 @@ DATE_FORMATS = [
 # --- REQUIRED ENV KEYS ---
 REQUIRED_ENV_KEYS = [
     "GEMINI_API_KEY",
+    "OPEN_ROUTER_API_KEY",
     "GOOGLE_SEARCH_API_KEY",
     "GOOGLE_SEARCH_CX",
     "GOOGLE_CREDENTIALS_JSON",

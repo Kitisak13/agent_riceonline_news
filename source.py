@@ -26,6 +26,9 @@ from config import (
     GEMINI_PRIMARY_MODEL,
     GEMINI_FALLBACK_MODEL,
     GEMINI_TIMEOUT,
+    OPENROUTER_MODEL,
+    OPENROUTER_API_URL,
+    AI_TIMEOUT,
     USER_AGENT,
     DATA_DIR,
 )
@@ -45,16 +48,17 @@ from utils import (
 
 # Load environment variables
 load_dotenv()
-if not os.getenv("GEMINI_API_KEY"):
+if not os.getenv("GEMINI_API_KEY") and not os.getenv("OPEN_ROUTER_API_KEY"):
     load_dotenv("../.env")
 
 # API Keys
 API_KEY = os.getenv("GOOGLE_SEARCH_API_KEY")
 SEARCH_ENGINE_ID = os.getenv("GOOGLE_SEARCH_CX")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Configure Gemini client (new google.genai SDK)
+# --- AI CLIENT SETUP ---
+# Primary AI: Gemini Client
 gemini_client = None
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if GEMINI_API_KEY:
     try:
         clean_key = GEMINI_API_KEY.strip().strip('"').strip("'")
@@ -63,6 +67,14 @@ if GEMINI_API_KEY:
     except Exception as e:
         logger.error(f"Failed to configure Gemini: {e}")
         gemini_client = None
+
+# Backup AI: OpenRouter (GPT-4o-mini)
+OPEN_ROUTER_API_KEY = os.getenv("OPEN_ROUTER_API_KEY")
+if OPEN_ROUTER_API_KEY:
+    OPEN_ROUTER_API_KEY = OPEN_ROUTER_API_KEY.strip().strip('"').strip("'")
+    logger.info(f"✨ OpenRouter AI configured as Backup (Model: {OPENROUTER_MODEL})")
+else:
+    logger.warning("⚠️ OPEN_ROUTER_API_KEY not found in environment variables (Backup AI disabled).")
 
 CURRENT_YEAR = datetime.now().year
 
@@ -263,31 +275,62 @@ def smart_select_url(headline: str, source: str, search_items: List[Dict[str, An
         Return ONLY the raw URL string. If no suitable URL is found, return "None".
         """
         
-        gemini_limiter.wait()
-        
-        response = gemini_client.models.generate_content(
-            model=GEMINI_PRIMARY_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT)
-            )
-        )
-        
-        selected_url = response.text.strip().replace("```", "").strip()
-        if "None" in selected_url or not selected_url.startswith("http"):
-            return None
-            
-        logger.info(f"   🧠 AI Selected ({GEMINI_PRIMARY_MODEL}): {selected_url[:55]}...")
-        return selected_url
+        # 1. Primary AI: Gemini
+        if gemini_client:
+            try:
+                gemini_limiter.wait()
+                response = gemini_client.models.generate_content(
+                    model=GEMINI_PRIMARY_MODEL,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT)
+                    )
+                )
+                selected_url = response.text.strip().replace("```", "").strip()
+                if selected_url.startswith("http") and "None" not in selected_url:
+                    logger.info(f"   🧠 Gemini Selected ({GEMINI_PRIMARY_MODEL}): {selected_url[:55]}...")
+                    return selected_url
+            except Exception as e:
+                logger.warning(f"   ⚠️ Gemini URL Selection failed: {e}. Trying OpenRouter fallback...")
+
+        # 2. Backup AI: OpenRouter (GPT-4o-mini)
+        if OPEN_ROUTER_API_KEY:
+            try:
+                gemini_limiter.wait()
+                headers = {
+                    "Authorization": f"Bearer {OPEN_ROUTER_API_KEY}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://github.com/agent_riceonline_news",
+                    "X-Title": "Rice News Aggregator",
+                }
+                payload = {
+                    "model": OPENROUTER_MODEL,
+                    "messages": [
+                        {"role": "user", "content": prompt}
+                    ],
+                    "temperature": 0.1,
+                }
+                resp = requests.post(OPENROUTER_API_URL, headers=headers, json=payload, timeout=AI_TIMEOUT)
+                if resp.status_code == 200:
+                    selected_url = resp.json()["choices"][0]["message"]["content"].strip().replace("```", "").strip()
+                    if selected_url.startswith("http") and "None" not in selected_url:
+                        logger.info(f"   🧠 OpenRouter Selected ({OPENROUTER_MODEL}): {selected_url[:55]}...")
+                        return selected_url
+                else:
+                    logger.warning(f"   ⚠️ OpenRouter URL Selection error {resp.status_code}: {resp.text[:150]}")
+            except Exception as e:
+                logger.error(f"   ⚠️ OpenRouter URL Selection Error: {e}")
+
+        return None
 
     except Exception as e:
-        logger.error(f"   ⚠️ Gemini URL Selection Error: {e}")
+        logger.error(f"   ⚠️ URL Selection Error: {e}")
         return None
 
 
 def gemini_direct_grounding_search(headline: str, source: str) -> Optional[str]:
     """
-    Tier 4 Fallback: Use Gemini 2.5 Flash Search Grounding to find original news article URL.
+    Tier 4 Fallback: Use Gemini Search Grounding to find original news article URL.
     """
     if not gemini_client:
         return None
