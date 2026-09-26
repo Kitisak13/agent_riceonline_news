@@ -121,42 +121,38 @@ _cached_chromedriver_path = None
 
 
 def get_chromedriver_path() -> Optional[str]:
-    """Finds or detects ChromeDriver with aggressive caching to avoid network calls."""
+    """Finds or detects matching ChromeDriver with aggressive caching, picking newest version first."""
     global _cached_chromedriver_path
     if _cached_chromedriver_path and os.path.exists(_cached_chromedriver_path):
         return _cached_chromedriver_path
 
-    # 1. Check local project root
+    # Check local project root first
     for local_path in ["chromedriver.exe", os.path.join("..", "chromedriver.exe")]:
         if os.path.exists(local_path):
             _cached_chromedriver_path = os.path.abspath(local_path)
             return _cached_chromedriver_path
 
-    # 2. Check local webdriver-manager cache on disk
-    wdm_root = os.path.expandvars(r"%USERPROFILE%\.wdm\drivers\chromedriver")
-    if os.path.exists(wdm_root):
-        for root, _, files in os.walk(wdm_root):
-            for f in files:
-                if f.lower() == "chromedriver.exe":
-                    _cached_chromedriver_path = os.path.join(root, f)
-                    return _cached_chromedriver_path
+    # Check local webdriver-manager cache on disk, sorted by version DESCENDING
+    for sub in [r"%USERPROFILE%\.wdm\drivers\chromedriver\win64", r"%USERPROFILE%\.wdm\drivers\chromedriver"]:
+        wdm_root = os.path.expandvars(sub)
+        if os.path.exists(wdm_root):
+            try:
+                versions = sorted(
+                    [d for d in os.listdir(wdm_root) if os.path.isdir(os.path.join(wdm_root, d))],
+                    key=lambda v: [int(x) if x.isdigit() else 0 for x in v.split('.')],
+                    reverse=True
+                )
+                for v in versions:
+                    for root, _, files in os.walk(os.path.join(wdm_root, v)):
+                        for f in files:
+                            if f.lower() == "chromedriver.exe":
+                                _cached_chromedriver_path = os.path.join(root, f)
+                                return _cached_chromedriver_path
+            except Exception:
+                pass
 
-    # 3. Fallback to webdriver-manager install
-    try:
-        logger.info("   📥 Resolving ChromeDriver via webdriver-manager...")
-        installed = ChromeDriverManager().install()
-        if not installed.lower().endswith("chromedriver.exe"):
-            driver_dir = os.path.dirname(installed)
-            for root, _, files in os.walk(driver_dir):
-                for f in files:
-                    if f.lower() == "chromedriver.exe":
-                        installed = os.path.join(root, f)
-                        break
-        _cached_chromedriver_path = installed
-        return _cached_chromedriver_path
-    except Exception as e:
-        logger.warning(f"   ⚠️ webdriver-manager detection failed: {e}")
-        return None
+    # Fallback to None (Selenium 4's built-in manager will resolve natively)
+    return None
 
 
 class SeleniumSessionManager:
@@ -217,8 +213,19 @@ class SeleniumSessionManager:
         
         driver_path = get_chromedriver_path()
         service = Service(executable_path=driver_path) if driver_path else Service()
-            
-        driver = webdriver.Chrome(service=service, options=chrome_options)
+        
+        try:
+            driver = webdriver.Chrome(service=service, options=chrome_options)
+        except Exception as e:
+            if driver_path and ("version" in str(e).lower() or "session not created" in str(e).lower()):
+                logger.warning(f"   ⚠️ ChromeDriver version mismatch ({e}). Falling back to Selenium 4 native manager...")
+                global _cached_chromedriver_path
+                _cached_chromedriver_path = None
+                service = Service()
+                driver = webdriver.Chrome(service=service, options=chrome_options)
+            else:
+                raise e
+
         try:
             driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
                 "source": "Object.defineProperty(navigator, 'webdriver', { get: () => undefined })"
