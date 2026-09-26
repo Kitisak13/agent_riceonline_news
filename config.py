@@ -15,8 +15,9 @@ OUTPUT_SOURCE_FILE = os.path.join(DATA_DIR, "source.json")
 
 # --- SELENIUM CONFIG ---
 HEADLESS_BROWSER = True  # Run in headless mode (no UI)
-SELENIUM_WAIT_TIMEOUT = 20  # seconds
-PAGE_LOAD_TIMEOUT = 20  # seconds
+SELENIUM_WAIT_TIMEOUT = 8  # seconds
+PAGE_LOAD_TIMEOUT = 15  # seconds
+SELENIUM_LOCK_TIMEOUT = 25  # seconds maximum wait to acquire browser lock
 
 # --- AI & PROCESSING CONFIG ---
 # Primary AI: Gemini Model (15 RPM, 500 RPD)
@@ -28,10 +29,10 @@ GEMINI_TIMEOUT = 12000  # Timeout for Gemini API calls in milliseconds (12 secon
 # Backup AI: OpenRouter (OpenAI GPT-4o-mini fallback)
 OPENROUTER_MODEL = "openai/gpt-4o-mini"
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
-AI_TIMEOUT = 30  # seconds timeout for HTTP AI calls
+AI_TIMEOUT = 20  # seconds timeout for HTTP AI calls
 AI_DELAY = 1.0  # seconds between calls
 
-ITEM_PROCESSING_TIMEOUT = 120.0  # seconds maximum timeout per news item (allows Selenium + fallback)
+ITEM_PROCESSING_TIMEOUT = 90.0  # seconds maximum timeout per news item
 CHECKPOINT_FILE = os.path.join(DATA_DIR, "checkpoint_results.json")
 MAX_RETRIES = 3
 OLD_NEWS_DAYS = 10  # Filter out news older than X days

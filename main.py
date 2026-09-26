@@ -5,6 +5,8 @@ import atexit
 import json
 import os
 import random
+import shutil
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
@@ -52,6 +54,7 @@ from config import (
     OLD_NEWS_DAYS,
     PAGE_LOAD_TIMEOUT,
     REQUIRED_ENV_KEYS,
+    SELENIUM_LOCK_TIMEOUT,
     SELENIUM_SESSION_MAX_URLS,
     SELENIUM_WAIT_TIMEOUT,
     OUTPUT_SOURCE_FILE,
@@ -91,10 +94,6 @@ def get_random_user_agent() -> str:
     return random.choice(USER_AGENTS)
 
 
-def get_google_cache_url(url: str) -> str:
-    return f"https://webcache.googleusercontent.com/search?q=cache:{quote(url)}"
-
-
 # --- AI CLIENT SETUP ---
 # Primary AI: Gemini Client
 gemini_client = None
@@ -118,6 +117,48 @@ else:
 # ==============================================================================
 # THREAD-SAFE SELENIUM SESSION MANAGER
 # ==============================================================================
+_cached_chromedriver_path = None
+
+
+def get_chromedriver_path() -> Optional[str]:
+    """Finds or detects ChromeDriver with aggressive caching to avoid network calls."""
+    global _cached_chromedriver_path
+    if _cached_chromedriver_path and os.path.exists(_cached_chromedriver_path):
+        return _cached_chromedriver_path
+
+    # 1. Check local project root
+    for local_path in ["chromedriver.exe", os.path.join("..", "chromedriver.exe")]:
+        if os.path.exists(local_path):
+            _cached_chromedriver_path = os.path.abspath(local_path)
+            return _cached_chromedriver_path
+
+    # 2. Check local webdriver-manager cache on disk
+    wdm_root = os.path.expandvars(r"%USERPROFILE%\.wdm\drivers\chromedriver")
+    if os.path.exists(wdm_root):
+        for root, _, files in os.walk(wdm_root):
+            for f in files:
+                if f.lower() == "chromedriver.exe":
+                    _cached_chromedriver_path = os.path.join(root, f)
+                    return _cached_chromedriver_path
+
+    # 3. Fallback to webdriver-manager install
+    try:
+        logger.info("   📥 Resolving ChromeDriver via webdriver-manager...")
+        installed = ChromeDriverManager().install()
+        if not installed.lower().endswith("chromedriver.exe"):
+            driver_dir = os.path.dirname(installed)
+            for root, _, files in os.walk(driver_dir):
+                for f in files:
+                    if f.lower() == "chromedriver.exe":
+                        installed = os.path.join(root, f)
+                        break
+        _cached_chromedriver_path = installed
+        return _cached_chromedriver_path
+    except Exception as e:
+        logger.warning(f"   ⚠️ webdriver-manager detection failed: {e}")
+        return None
+
+
 class SeleniumSessionManager:
     _instance = None
     _lock = threading.Lock()
@@ -128,6 +169,7 @@ class SeleniumSessionManager:
                 if cls._instance is None:
                     cls._instance = super().__new__(cls)
                     cls._instance._driver = None
+                    cls._instance._user_data_dir = None
                     cls._instance._url_count = 0
                     cls._instance._max_urls = SELENIUM_SESSION_MAX_URLS
         return cls._instance
@@ -153,34 +195,36 @@ class SeleniumSessionManager:
         if HEADLESS_BROWSER:
             chrome_options.add_argument("--headless=new")
         
+        # Eager strategy loads DOM without waiting indefinitely for trackers/images
+        chrome_options.page_load_strategy = 'eager'
+        chrome_options.add_argument("--remote-debugging-port=0")
         chrome_options.add_argument("--disable-gpu")
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--disable-software-rasterizer")
+        chrome_options.add_argument("--disable-extensions")
+        chrome_options.add_argument("--disable-background-networking")
+        chrome_options.add_argument("--disable-sync")
         chrome_options.add_argument("--mute-audio")
         chrome_options.add_argument(f"--user-agent={get_random_user_agent()}")
         chrome_options.add_argument("--disable-blink-features=AutomationControlled")
         chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
         chrome_options.add_experimental_option('useAutomationExtension', False)
+
+        # Isolated user data directory to prevent profile lock conflicts
+        self._user_data_dir = tempfile.mkdtemp(prefix="selenium_chrome_")
+        chrome_options.add_argument(f"--user-data-dir={self._user_data_dir}")
         
-        try:
-            logger.info("   📥 Auto-detecting ChromeDriver version via webdriver-manager...")
-            service = Service(ChromeDriverManager().install())
-        except Exception as e:
-            logger.warning(f"   ⚠️ webdriver-manager failed ({e}), trying local chromedriver...")
-            local_driver_path = os.path.join(os.getcwd(), "chromedriver.exe")
-            if os.path.exists(local_driver_path):
-                service = Service(executable_path=local_driver_path)
-            else:
-                parent_driver = os.path.join(os.getcwd(), "..", "chromedriver.exe")
-                if os.path.exists(parent_driver):
-                    service = Service(executable_path=parent_driver)
-                else:
-                    raise RuntimeError("No compatible ChromeDriver found. Please update chromedriver.exe.")
+        driver_path = get_chromedriver_path()
+        service = Service(executable_path=driver_path) if driver_path else Service()
             
         driver = webdriver.Chrome(service=service, options=chrome_options)
-        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-            "source": "Object.defineProperty(navigator, 'webdriver', { get: () => undefined })"
-        })
+        try:
+            driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+                "source": "Object.defineProperty(navigator, 'webdriver', { get: () => undefined })"
+            })
+        except Exception:
+            pass
         driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
         driver.set_script_timeout(PAGE_LOAD_TIMEOUT)
         return driver
@@ -205,6 +249,12 @@ class SeleniumSessionManager:
                 pass
             self._driver = None
             self._url_count = 0
+        if self._user_data_dir and os.path.exists(self._user_data_dir):
+            try:
+                shutil.rmtree(self._user_data_dir, ignore_errors=True)
+            except Exception:
+                pass
+            self._user_data_dir = None
     
     def _wait_for_content(self, driver):
         try:
@@ -242,63 +292,67 @@ class SeleniumSessionManager:
                 if len(text) > 30: continue
                 try:
                     driver.execute_script("arguments[0].scrollIntoView(true);", btn)
-                    time.sleep(0.5)
+                    time.sleep(0.3)
                     driver.execute_script("arguments[0].click();", btn)
                     logger.info(f"   🖱️ Auto-clicked expand button: '{text}'")
-                    time.sleep(1.0)
+                    time.sleep(0.5)
                     break
                 except Exception:
                     continue
         except Exception:
             pass
 
-    def scrape_url(self, url: str, use_cache_fallback: bool = True) -> Optional[str]:
-        with self._lock:
-            try:
-                driver = self._get_driver()
-                logger.info(f"   🌐 Selenium [{self._url_count + 1}/{self._max_urls}]: {url[:50]}...")
-                time.sleep(random.uniform(0.5, 1.5))
-                
-                driver.get(url)
-                self._url_count += 1
-                
-                content_loaded = self._wait_for_content(driver)
-                
-                if self._is_cloudflare_blocked(driver):
-                    logger.warning("   🛡️ Cloudflare detected in Selenium!")
-                    if use_cache_fallback:
-                        logger.info("   📦 Trying Google Cache fallback...")
-                        cache_url = get_google_cache_url(url)
-                        time.sleep(random.uniform(1, 2))
-                        driver.get(cache_url)
-                        self._url_count += 1
-                        if not self._wait_for_content(driver):
-                            logger.error("   ❌ Cache fallback failed")
-                            return None
-                    else:
-                        return None
-                
-                self._expand_hidden_content(driver)
-                html = driver.page_source
-                
-                extract_params = {'include_comments': False, 'include_tables': True, 'output_format': 'json', 'with_metadata': True}
-                extract_str = trafilatura.extract(html, **extract_params)
-                if extract_str:
-                    return json.loads(extract_str).get('text', '')
-                
-                body = driver.find_element(By.TAG_NAME, "body")
-                text = body.text.strip()
-                return text if len(text) > 200 else None
-                
-            except Exception as e:
-                error_msg = str(e).lower()
-                if any(term in error_msg for term in ["timeout", "max retries", "connectionpool", "not reachable"]):
-                    logger.error(f"   ❌ Critical Driver Error: {str(e)[:100]}")
-                    self._close_driver()
-                else:
-                    logger.error(f"   ❌ Selenium Error: {e}")
-                    self._close_driver()
+    def scrape_url(self, url: str) -> Optional[str]:
+        # Acquire lock with strict timeout to prevent multi-thread deadlocks
+        acquired = self._lock.acquire(timeout=SELENIUM_LOCK_TIMEOUT)
+        if not acquired:
+            logger.warning(f"   ⚠️ Selenium session busy (lock wait > {SELENIUM_LOCK_TIMEOUT}s). Skipping to AI Grounding fallback...")
+            return None
+
+        try:
+            driver = self._get_driver()
+            if not driver:
                 return None
+                
+            logger.info(f"   🌐 Selenium [{self._url_count + 1}/{self._max_urls}]: {url[:50]}...")
+            time.sleep(random.uniform(0.3, 0.6))
+            
+            try:
+                driver.get(url)
+            except Exception as e:
+                logger.warning(f"   ⚠️ Page navigation timed out or partial ({str(e)[:80]}), reading loaded DOM...")
+                
+            self._url_count += 1
+            
+            self._wait_for_content(driver)
+            
+            if self._is_cloudflare_blocked(driver):
+                logger.warning("   🛡️ Cloudflare detected in Selenium! Fast-failing to Gemini Grounding fallback...")
+                return None
+            
+            self._expand_hidden_content(driver)
+            html = driver.page_source
+            
+            extract_params = {'include_comments': False, 'include_tables': True, 'output_format': 'json', 'with_metadata': True}
+            extract_str = trafilatura.extract(html, **extract_params)
+            if extract_str:
+                return json.loads(extract_str).get('text', '')
+            
+            body = driver.find_element(By.TAG_NAME, "body")
+            text = body.text.strip()
+            return text if len(text) > 200 else None
+            
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(term in error_msg for term in ["timeout", "max retries", "connectionpool", "not reachable", "disconnected"]):
+                logger.error(f"   ❌ Critical Driver Error: {str(e)[:100]}")
+                self._close_driver()
+            else:
+                logger.error(f"   ❌ Selenium Error: {e}")
+                self._close_driver()
+            return None
+        finally:
+            self._lock.release()
     
     def close(self):
         with self._lock:
@@ -425,9 +479,13 @@ def scrape_content(url: str) -> Optional[Any]:
     if requires_selenium(url):
         logger.info("   ⚡ Fast-track to Selenium (known domain)")
         manager = get_selenium_manager()
-        text = manager.scrape_url(url, use_cache_fallback=True)
+        text = manager.scrape_url(url)
         if text:
             return {"text": text, "title": "", "date": "", "source": url}
+        # Fallback to Grounding Scraper if fast-track Selenium fails
+        fallback_data = gemini_grounding_fallback_scrape(url)
+        if fallback_data:
+            return fallback_data
         return None
         
     extract_params = {'include_comments': False, 'include_tables': True, 'output_format': 'json', 'with_metadata': True}
@@ -497,7 +555,7 @@ def scrape_content(url: str) -> Optional[Any]:
     logger.info("   ⚠️ HTTP extraction failed, trying Selenium...")
     domain_cache.record_failure(url)
     manager = get_selenium_manager()
-    sel_text = manager.scrape_url(url, use_cache_fallback=True)
+    sel_text = manager.scrape_url(url)
     if sel_text:
         return {"text": sel_text, "title": "", "date": "", "source": url}
 
@@ -784,10 +842,11 @@ def main():
 
     executor = ThreadPoolExecutor(max_workers=CONCURRENT_WORKERS)
     try:
-        # Concurrent processing using ThreadPoolExecutor with strict timeout
+        # Concurrent processing using ThreadPoolExecutor with as_completed (fast items record immediately)
         future_to_item = {executor.submit(process_single_item, item): item for item in target_headlines}
         
-        for future, item in future_to_item.items():
+        for future in as_completed(future_to_item):
+            item = future_to_item[future]
             try:
                 res = future.result(timeout=ITEM_PROCESSING_TIMEOUT)
                 record_progress(res)
